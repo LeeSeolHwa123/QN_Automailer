@@ -1,0 +1,2062 @@
+import os, re, time, uuid, tempfile, traceback, datetime as dt
+from datetime import datetime as _dt
+import win32com.client as win32
+
+# =========================
+# TEST CONFIG (← 이 날짜만 바꾸면 테스트 가능)
+# =========================
+TEST_DATE = dt.date(2025, 12, 15)   # ← 원하는 테스트 날짜로 변경
+USE_ACTIVE_MAIL_FIRST = True       # 열린 메일 우선 사용
+MAIL_SUBJECT_KEY = "QN 등록 현황 공유"
+
+CONFIG = {
+    "EXPORT_DIR": r"C:\Users\seolhl\OneDrive - kochind.com\Documents\SAP\SAP GUI",
+    "PLANT": "2201",
+    # ZQCN - 첫 번째 표(C1-CK)
+    "ZQCN_C_FIRST_TYPES": ["C1","C3","C5","C7","G1","G3","G5","G7","N1","CK"],
+    # ZQCN - 두 번째 표(Q1~Q9)
+    "ZQCN_Q_SECOND_TYPES": [f"Q{i}" for i in range(1,10)],
+    # 파일명 규칙
+    "FILE_FIRST": "{YYYYMMDD}.txt",
+    "FILE_SECOND": "{YYYYMMDD}_Q1.txt",
+    "FILE_ZNOT": "{YYYYMMDD}_ZNOT.txt",
+}
+# =========================
+# QN TYPE 집합 정의
+# =========================
+VALID_TYPES_FIRST = {"C1","C3","C5","C7","G1","G3","G5","G7","N1","CK"}
+VALID_TYPES_SECOND = {f"Q{i}" for i in range(1,10)}
+
+def simplify_qn_type(raw: str) -> str:
+    if not raw:
+        return ""
+    raw = raw.strip().upper()
+
+    # 정확히 일치하는 경우
+    if raw in VALID_TYPES_FIRST:
+        return raw
+    if raw in VALID_TYPES_SECOND:
+        return raw
+
+    # 접두사 패턴 매칭 (Q1~, C3~, CK~, G5~, N1~ 등)
+    m = re.match(r"^(Q[1-9]|C[1357]|G[1357]|N1|CK)", raw)
+    if m:
+        return m.group(1)
+
+    # 그래도 없으면 원본 전체를 반환 (디버깅 목적)
+    return raw
+
+    
+def dstr(d: dt.date): return d.strftime("%Y%m%d")
+def yday(d: dt.date): return d - dt.timedelta(days=1)
+
+def path_first(day: dt.date):
+    return os.path.join(CONFIG["EXPORT_DIR"], CONFIG["FILE_FIRST"].format(YYYYMMDD=dstr(day)))
+def path_second(day: dt.date):
+    return os.path.join(CONFIG["EXPORT_DIR"], CONFIG["FILE_SECOND"].format(YYYYMMDD=dstr(day)))
+def path_znot(day: dt.date):
+    return os.path.join(CONFIG["EXPORT_DIR"], CONFIG["FILE_ZNOT"].format(YYYYMMDD=dstr(day)))
+
+def log(msg): print(msg, flush=True)
+def log_exc(ctx=""): print(f"[EXC] {ctx}\n{traceback.format_exc()}", flush=True)
+
+# =========================
+# SAP COMMON (세션/대기/입력/실행/내보내기)
+# =========================
+def get_session():
+    SapGuiAuto = win32.GetObject("SAPGUI")
+    app = SapGuiAuto.GetScriptingEngine
+    for ci in range(app.Children.Count):
+        con = app.Children(ci)
+        if con.DisabledByServer: continue
+        for si in range(con.Children.Count):
+            ses = con.Children(si)
+            try:
+                _ = ses.findById("wnd[0]")
+                log(f"[SAP] 세션 연결됨: {ses.Info.SystemName}/{ses.Info.Client}/{ses.Info.User} Tx={ses.Info.Transaction}")
+                return ses
+            except: pass
+    raise RuntimeError("활성 SAP 세션을 찾지 못했습니다.")
+
+def wait_exists(session, obj_id, timeout=10, interval=0.2):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            return session.findById(obj_id)
+        except:
+            time.sleep(interval)
+    return None
+
+def safe_settext(session, obj_id, text):
+    ctl = wait_exists(session, obj_id, timeout=8)
+    if not ctl: raise RuntimeError(f"컨트롤 없음: {obj_id}")
+    ctl.text = str(text)
+    try: ctl.setFocus()
+    except: pass
+
+def safe_press(session, obj_id):
+    btn = wait_exists(session, obj_id, timeout=8)
+    if not btn: raise RuntimeError(f"버튼 없음: {obj_id}")
+    btn.press()
+
+def send_enter(session, wnd="wnd[0]"): session.findById(wnd).sendVKey(0)
+
+def wait_idle(session, timeout=20):
+    app = win32.GetObject("SAPGUI").GetScriptingEngine
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            if not app.Busy and not session.Busy:
+                return True
+        except: pass
+        time.sleep(0.15)
+    return False
+
+def close_any_popup(session):
+    try:
+        if session.FindById("wnd[1]", False):
+            session.findById("wnd[1]").sendVKey(0)
+            wait_idle(session, 5)
+            log("[SAP] 팝업 Enter로 닫음")
+            return True
+    except: pass
+    return False
+
+def go_tcode(session, tcode):
+    ok = wait_exists(session, "wnd[0]/tbar[0]/okcd", timeout=8)
+    ok.text = f"/n{tcode}"
+    send_enter(session)
+    wait_idle(session, 10)
+    log(f"[SAP] TCode 이동: {tcode}")
+
+def page_down(session, wnd="0", repeat=1):
+    for _ in range(repeat):
+        session.findById(f"wnd[{wnd}]").sendVKey(82)
+
+def set_zqcn_common_filters(session, start_date: dt.date, end_date: dt.date, plant: str):
+    safe_settext(session, "wnd[0]/usr/ctxt[4]", start_date.strftime("%Y/%m/%d"))
+    safe_settext(session, "wnd[0]/usr/ctxt[5]", end_date.strftime("%Y/%m/%d"))
+    safe_settext(session, "wnd[0]/usr/ctxt[8]", plant)
+    # 상태 4개 모두 체크
+    wait_exists(session, "wnd[0]/usr/chk[0]").selected = True  # Open
+    wait_exists(session, "wnd[0]/usr/chk[1]").selected = True  # Postponed
+    wait_exists(session, "wnd[0]/usr/chk[2]").selected = True  # Being processed
+    wait_exists(session, "wnd[0]/usr/chk[3]").selected = True  # Completed
+    log(f"[ZQCN] 기간={start_date}~{end_date}, Plant={plant} 상태=ALL")
+
+def multisel_types(session, types):
+
+    safe_press(session, "wnd[0]/usr/btn[1]")
+    TABLE_BASE = "wnd[1]/usr/tabsTAB_STRIP/tabpSIVA/ssub/1/2/tblSAPLALDBSINGLE"
+    wait_exists(session, TABLE_BASE, timeout=10)
+
+    # ============================================================
+    # 1) 첫 페이지: 첫 8개 입력
+    # ============================================================
+    first_page_count = min(8, len(types))
+
+    for idx in range(first_page_count):
+        cell_id = f"{TABLE_BASE}/ctxt[1,{idx}]"
+        safe_settext(session, cell_id, types[idx])
+        time.sleep(0.25)
+
+    log(f"✓ 첫 페이지 입력 완료: {types[:first_page_count]}")
+
+    # 커밋 (Enter)
+    if first_page_count > 0:
+        try:
+            last_cell = f"{TABLE_BASE}/ctxt[1,{first_page_count-1}]"
+            session.findById(last_cell).setFocus()
+            session.findById("wnd[1]").sendVKey(0)
+        except Exception as e:
+            log(f"⚠ 첫 페이지 커밋 실패: {e}")
+
+    wait_idle(session, timeout=4)
+    time.sleep(0.4)
+
+
+    # ============================================================
+    # 2) 남은 타입이 없으면 종료
+    # ============================================================
+    if len(types) <= 8:
+        pass
+    else:
+        # ============================================================
+        # 3) PageDown 후 두 번째 페이지에 입력
+        # ============================================================
+        try:
+            log("▼ PageDown: 다음 페이지 이동")
+            session.findById("wnd[1]").sendVKey(82)
+            wait_idle(session, timeout=6)
+            time.sleep(1.0)
+        except Exception as e:
+            log(f"⚠ PageDown 이동 실패: {e}")
+
+        # 🔥 두 번째 페이지 입력값 구성
+        last_first_page_value = types[7]   # 첫 페이지 마지막 값
+        remaining = [last_first_page_value] + types[8:]
+
+        log(f"→ 두 번째 페이지 입력: {remaining}")
+
+        for idx, val in enumerate(remaining):
+            try:
+                cell_id = f"{TABLE_BASE}/ctxt[1,{idx}]"
+                safe_settext(session, cell_id, val)
+                time.sleep(0.3)
+            except Exception as e:
+                log(f"⚠ 두 번째 페이지 {val} 입력 실패: {e}")
+
+        # 커밋
+        try:
+            last_idx = len(remaining) - 1
+            last_cell = f"{TABLE_BASE}/ctxt[1,{last_idx}]"
+            session.findById(last_cell).setFocus()
+            session.findById("wnd[1]").sendVKey(0)
+        except Exception as e:
+            log(f"⚠ 두 번째 페이지 커밋 실패: {e}")
+
+        wait_idle(session, timeout=4)
+        time.sleep(0.4)
+
+
+    # ============================================================
+    # 4) 팝업 닫기
+    # ============================================================
+    closed = False
+    for _ in range(3):
+        try:
+            tbar = session.findById("wnd[1]/tbar[0]")
+            for i in range(tbar.Children.Count):
+                b = tbar.Children(i)
+                tip = (getattr(b, "Tooltip", "") or "") + " " + (getattr(b, "Text", "") or "")
+                if any(k in tip.lower() for k in ("ok", "확인", "apply", "적용", "copy", "복사", "transfer", "전달")):
+                    b.press()
+                    time.sleep(0.2)
+                    break
+        except:
+            pass
+
+        try:
+            if not session.FindById("wnd[1]", False):
+                closed = True
+                break
+        except:
+            closed = True
+            break
+
+        try:
+            session.findById("wnd[1]").sendVKey(0)
+        except:
+            pass
+
+    log(f"[ZQCN] 입력 완료 (팝업닫힘={closed})")
+
+
+def execute_onli(session):
+    close_any_popup(session)
+    ok = wait_exists(session, "wnd[0]/tbar[0]/okcd", timeout=6)
+    ok.text = "=ONLI"
+    send_enter(session)
+    wait_idle(session, 12)
+    log("[ZQCN] 실행(=ONLI) 완료 → 결과화면 도달 시 내보내기 진행")
+
+def try_select_radio(session, ids):
+    for rid in ids:
+        try:
+            session.findById(rid).select()
+            return True
+        except: pass
+    return False
+
+def export_list_text_with_tabs(session, out_dir: str, file_basename: str):
+    if not os.path.isdir(out_dir): raise RuntimeError(f"경로 없음: {out_dir}")
+    full_path = os.path.join(out_dir, file_basename)
+    log(f"[Export] 저장 예정: {full_path}")
+
+    session.findById("wnd[0]/tbar[0]/okcd").text = "%PC"
+    send_enter(session)
+
+    fmt = wait_exists(session, "wnd[1]", timeout=5)
+    if fmt:
+        radio_candidates = [
+            "wnd[1]/usr/sub/2/sub/2/1/rad[1,0]",
+            "wnd[1]/usr/rad[1,0]",
+            "wnd[1]/usr/ssub/2/2/rad[1,0]",
+        ]
+        if try_select_radio(session, radio_candidates):
+            try: safe_press(session, "wnd[1]/tbar[0]/btn[0]")  # Generate
+            except: safe_press(session, "wnd[1]/tbar[0]/btn[2]")
+
+    path_popup = wait_exists(session, "wnd[1]/usr", timeout=6)
+    if not path_popup:
+        log("⚠ 경로/파일명 팝업이 안 뜸 → 바로 저장 설정일 수 있음")
+        return full_path
+
+    try:
+        session.findById("wnd[1]/usr/ctxt[0]").text = out_dir
+        session.findById("wnd[1]/usr/ctxt[1]").text = file_basename
+    except:
+        usr = session.findById("wnd[1]/usr")
+        for c in usr.Children:
+            try:
+                cid = c.Id.lower()
+                if ("dy_path" in cid or "ctxt[0]" in cid) and hasattr(c, "text"):
+                    c.text = out_dir
+                if ("dy_filename" in cid or "ctxt[1]" in cid) and hasattr(c, "text"):
+                    c.text = file_basename
+            except: pass
+
+    try: safe_press(session, "wnd[1]/tbar[0]/btn[0]")
+    except: safe_press(session, "wnd[1]/tbar[0]/btn[2]")
+
+    log("✅ 내보내기 완료")
+    return full_path
+
+def run_zqcn_and_export(session, start_date: dt.date, end_date: dt.date, notif_types, outfile_fullpath):
+    go_tcode(session, "ZQCN")
+    set_zqcn_common_filters(session, start_date, end_date, CONFIG["PLANT"])
+    multisel_types(session, notif_types)
+    execute_onli(session)
+    export_list_text_with_tabs(session, CONFIG["EXPORT_DIR"], os.path.basename(outfile_fullpath))
+
+def ensure_files_for_test_date(day: dt.date):
+    """TEST_DATE 기준 3개 파일 없으면 SAP에서 실행해 생성."""
+    ses = get_session()
+    y1 = dt.date(day.year, 1, 1)
+
+    f1 = path_first(day)
+    if not os.path.isfile(f1):
+        log("[RUN] ZQCN(C1~CK) 수행 → 첫 번째 표 파일 생성")
+        run_zqcn_and_export(ses, y1, day, CONFIG["ZQCN_C_FIRST_TYPES"], f1)
+
+    f2 = path_second(day)
+    if not os.path.isfile(f2):
+        log("[RUN] ZQCN(Q1~Q9) 수행 → 두 번째 표 파일 생성")
+        run_zqcn_and_export(ses, y1, day, CONFIG["ZQCN_Q_SECOND_TYPES"], f2)
+
+    fz = path_znot(day)
+    if not os.path.isfile(fz):
+        log("[RUN] ZNOT(C1~CK) 수행 → ZNOT 파일 생성")
+        go_tcode(ses, "ZNOT")
+        # 날짜
+        safe_settext(ses, "wnd[0]/usr/ctxt[0]", y1.strftime("%Y%m%d"))
+        safe_settext(ses, "wnd[0]/usr/ctxt[1]", day.strftime("%Y%m%d"))
+        # Notification Type Multiple (C1~CK)
+        safe_press(ses, "wnd[0]/usr/btn[1]")
+        table = "wnd[1]/usr/tabsTAB_STRIP/tabpSIVA/ssub/1/2/tblSAPLALDBSINGLE"
+        wait_exists(ses, table, timeout=10)
+        vals = CONFIG["ZQCN_C_FIRST_TYPES"]
+        for idx in range(min(8, len(vals))):
+            ses.findById(f"{table}/ctxt[1,{idx}]").Text = vals[idx]
+        if len(vals) > 8:
+            ses.findById(table).VerticalScrollbar.Position += 1
+            for idx2, v in enumerate(vals[8:]):
+                ses.findById(f"{table}/ctxt[1,{idx2}]").Text = v
+        # Copy(F8)
+        safe_press(ses, "wnd[1]/tbar[0]/btn[8]")
+        # Plant
+        safe_settext(ses, "wnd[0]/usr/ctxt[6]", CONFIG["PLANT"])
+        # Execute(F8)
+        safe_press(ses, "wnd[0]/tbar[1]/btn[8]")
+        export_list_text_with_tabs(ses, CONFIG["EXPORT_DIR"], os.path.basename(fz))
+
+# =========================
+# 파일 파싱 & 신규/삭제 판별
+# =========================
+QN_RE = re.compile(r"\b(\d{8})\b")
+DATE_RE = re.compile(r"\b(\d{2}/\d{2}/\d{2})\b")
+
+def parse_export_txt(filepath, anchor_qn):
+    """
+    SAP Export 텍스트를 파싱해서
+    - QN: 8자리
+    - Created: 'YYYY.MM.DD' 형식으로 변환하여 반환
+    """
+    log(f"[PARSE] 파일 열기: {filepath}")
+    if not os.path.isfile(filepath): raise RuntimeError(f"파일 없음: {filepath}")
+    with open(filepath,"r",encoding="utf-8-sig",errors="ignore") as f:
+        lines=[ln.rstrip("\r\n") for ln in f]
+    log(f"[PARSE] 총 라인수: {len(lines)} / anchor_qn={anchor_qn}")
+
+    header_idx=None
+    header_text=""
+    for i,ln in enumerate(lines):
+        if "Notif" in ln and "Created" in ln:
+            header_idx=i; header_text=ln; break
+    if header_idx is None:
+        log("[PARSE] 헤더(Notif/Created) 미발견 → 데이터 0")
+        return []
+
+    log(f"[PARSE] 헤더 인덱스={header_idx} / 헤더='{header_text}'")
+    rows=[]
+    for ln in lines[header_idx+1:]:
+        s=ln.strip()
+        if not s or "Outstanding notification" in s: continue
+        m=QN_RE.search(s); 
+        if not m: continue
+        qn=m.group(1)
+        ds=DATE_RE.findall(s)
+        if not ds: continue
+
+        # --- 날짜 변환: 'MM/DD/YY' -> 'YYYY.MM.DD'
+        raw_date = ds[0]
+        try:
+            dt_obj = _dt.strptime(raw_date, "%y/%m/%d")
+            created_fmt = dt_obj.strftime("%Y.%m.%d")
+        except Exception as e:
+            log(f"[PARSE] 날짜 변환 실패: {raw_date} ({e})")
+            created_fmt = raw_date  # 실패시 원본 유지
+
+        rows.append({"QN":qn,"Created":created_fmt})
+    log(f"[PARSE] 데이터 행 파싱={len(rows)}건")
+
+    if not rows:
+        return []
+
+    if not anchor_qn:
+        log(f"[PARSE] anchor 없음 → 신규={len(rows)}건 (예: {rows[:3]})")
+        return rows
+
+    seq=[r["QN"] for r in rows]
+    try:
+        idx = seq.index(str(anchor_qn).strip())
+        new_rows = rows[idx+1:]
+        log(f"[PARSE] anchor 위치={idx} → 신규={len(new_rows)}건 (예: {new_rows[:3]})")
+        return new_rows
+    except ValueError:
+        log("[PARSE] anchor 미일치 → 전체 신규 처리")
+        log(f"[PARSE] 신규={len(rows)}건 (예: {rows[:3]})")
+        return rows
+
+def load_qn_list(filepath):
+    if not os.path.isfile(filepath): return []
+    with open(filepath,"r",encoding="utf-8-sig",errors="ignore") as f:
+        lines=[ln.rstrip("\r\n") for ln in f]
+    got=[]
+    for ln in lines:
+        m = QN_RE.search(ln)
+        if m: got.append(m.group(1))
+    return got
+
+def detect_deleted(prev_file, today_file):
+    prev_q = set(load_qn_list(prev_file))
+    today_q= set(load_qn_list(today_file))
+    deleted = sorted(list(prev_q - today_q))
+    log(f"[DELCHK] prev={os.path.basename(prev_file)}({len(prev_q)}) → today={os.path.basename(today_file)}({len(today_q)}) / 삭제추정={deleted}")
+    return deleted
+
+# =========================
+# Outlook (메일 소스/복제/날짜 치환)
+# =========================
+def get_active_mail():
+    outlook = win32.Dispatch("Outlook.Application")
+    insp = outlook.ActiveInspector()
+    if insp is None: return None
+    item = insp.CurrentItem
+    return item if getattr(item,"Class",None) == 43 else None
+
+def find_latest_qn_mail_before_date(target_date: dt.date):
+    """테스트 날짜 '이전' 메일만 후보"""
+    outlook = win32.Dispatch("Outlook.Application")
+    mapi = outlook.GetNamespace("MAPI")
+    sent = mapi.GetDefaultFolder(5)  # Sent
+    items = sent.Items
+    items.Sort("[SentOn]", True)
+    try: items.IncludeRecurrences=True
+    except: pass
+    for i in range(1, min(200, items.Count)+1):
+        it = items.Item(i)
+        if getattr(it,"Class",None) != 43: continue
+        subj = (getattr(it,"Subject","") or "")
+        sent_on = getattr(it, "SentOn", None)
+        sent_date = sent_on.date() if sent_on else None
+        if MAIL_SUBJECT_KEY in subj and sent_date and (sent_date < target_date):
+            log(f"[MAIL] 후보: {subj} | SentOn={sent_on}")
+            return it
+    return None
+
+
+def replace_date_in_subject(subject, src_date, dst_date):
+    if not subject: return subject
+    sm, sd = src_date.month, src_date.day
+    dm, dd = dst_date.month, dst_date.day
+    pat = rf"(?<!\d)0?{sm}/0?{sd}(?!\d)"
+    return re.sub(pat, f"{dm}/{dd}", subject)
+
+def replace_date_in_body(html, src_date, dst_date):
+    if not html: return html
+    sy, sm, sd = src_date.year, src_date.month, src_date.day
+    dy, dm, dd = dst_date.year, dst_date.month, dst_date.day
+    sep = r"(?:\s|&nbsp;|<[^>]+>)*"
+    pat = rf"{sy}{sep}년{sep}{sm}{sep}월{sep}{sd}{sep}일"
+    return re.sub(pat, f"{dy}년 {dm}월 {dd}일", html)
+
+# =========================
+# 메일 표 유틸 + 진단
+# =========================
+def get_tables(html): 
+    t = re.findall(r"(?is)<table\b.*?>.*?</table>", html)
+    log(f"[HTML] table count={len(t)}")
+    return t
+
+def table_rows(html_table): 
+    rows = re.findall(r"(?is)<tr\b.*?>.*?</tr>", html_table)
+    return rows
+
+def strip_html(s): return re.sub(r"(?is)<.*?>","",s).replace("\xa0"," ").strip()
+def header_cells(row_html): return [strip_html(x) for x in re.findall(r"(?is)<t[dh]\b.*?>.*?</t[dh]>", row_html)]
+def data_cells(row_html): return [strip_html(x) for x in re.findall(r"(?is)<t[dh]\b.*?>.*?</t[dh]>", row_html)]
+def rebuild_table(rows_html): return "<table>" + "".join(rows_html) + "</table>"
+
+def find_qn_index_from_header(hdrs):
+    for i, h in enumerate(hdrs):
+        H = h.upper().replace(" ", "")
+        if "QN" in H or "NOTIF" in H or "NOTIFICATION" in H or "QN#" in H:
+            return i
+    return None
+
+def extract_last_qn_from_table(table_html):
+    rows = table_rows(table_html)
+    log(f"[TBL] rows={len(rows)} (헤더 포함)")
+    if len(rows)<2: return None
+    hdrs = header_cells(rows[0])
+    qn_idx = find_qn_index_from_header(hdrs)
+    log(f"[TBL] 헤더셀={len(hdrs)} qn_idx={qn_idx} hdrs={hdrs}")
+    if qn_idx is None: return None
+    for r in range(len(rows)-1,0,-1):
+        cells = data_cells(rows[r])
+        if not any(cells): continue
+        if qn_idx < len(cells):
+            qn = cells[qn_idx].strip()
+            if qn:
+                log(f"[TBL] 마지막 QN 탐색 hit: r={r}, qn={qn}, rowCells={len(cells)}")
+                return qn
+    return None
+
+def count_data_rows(table_html):
+    rows = table_rows(table_html)
+    return max(0, len(rows)-1)
+
+def remove_deleted_from_table(table_html, deleted_qns):
+    before_rows = count_data_rows(table_html)
+    log(f"[MAIL/DEL] 삭제처리 시작 (before_rows={before_rows}, deleted_qns={deleted_qns})")
+    if not deleted_qns:
+        return table_html, []
+
+    rows = table_rows(table_html)
+    if len(rows) < 2:
+        return table_html, []
+    hdr = header_cells(rows[0])
+    qn_idx = find_qn_index_from_header(hdr)
+    if qn_idx is None:
+        log("[MAIL/DEL] QN 열 인덱스 미발견 → 삭제 불가")
+        return table_html, []
+
+    kept = [rows[0]]
+    removed = []
+    for r in rows[1:]:
+        cells = data_cells(r)
+        qn = cells[qn_idx] if qn_idx < len(cells) else ""
+        if qn.strip() in deleted_qns:
+            removed.append(qn.strip())
+            continue
+
+        # ✅ 열 개수 보존 (pairs 길이에 맞게 패딩)
+        pairs = re.findall(r"(?is)(<t[dh][^>]*>).*?(</t[dh]>)", r)
+        filled = cells + [""] * (len(pairs) - len(cells))
+        new_r = "<tr>" + "".join(
+            f"{pre}{filled[i]}{post}" for i, (pre, post) in enumerate(pairs)
+        ) + "</tr>"
+        kept.append(new_r)
+
+    new_html = rebuild_table(kept)
+    after_rows = count_data_rows(new_html)
+    log(f"[MAIL/DEL] 삭제완료 removed={removed} / after_rows={after_rows}")
+
+    residual = [q for q in removed if re.search(rf">{re.escape(q)}<", new_html)]
+    if residual:
+        log(f"⚠ [MAIL/DEL] 삭제 후에도 남아있는 QN 감지: {residual}")
+
+    return new_html, removed
+
+
+def append_new_rows_first(table_html, new_rows, header_mapping):
+    """첫 번째 표(C1~CK) 신규 행 추가"""
+    if not new_rows: 
+        log("[MAIL/ADD-FIRST] 추가할 신규 행 없음")
+        return table_html
+
+    rows = re.findall(r"(?is)<tr\b.*?>.*?</tr>", table_html)
+    if len(rows) < 1:
+        log("[MAIL/ADD-FIRST] 표 구조 이상(행 없음)")
+        return table_html
+
+    # 헤더 추출
+    hdrs = [re.sub(r"(?is)<.*?>","",h).replace("\xa0"," ").strip() 
+            for h in re.findall(r"(?is)<t[dh]\b.*?>.*?</t[dh]>", rows[0])]
+    hdr_cnt = len(hdrs)
+    log(f"[MAIL/ADD-FIRST] 헤더셀수={hdr_cnt}, header_mapping={header_mapping}")
+
+    # --- 매핑 ---
+    idx_map = {}
+    for key, hdr_sub in header_mapping.items():
+        candidates = hdr_sub if isinstance(hdr_sub,(list,tuple)) else [hdr_sub]
+        for cand in candidates:
+            for i,h in enumerate(hdrs):
+                if cand.lower().replace(" ","") in h.lower().replace(" ",""):
+                    idx_map[key] = i; break
+            if key in idx_map: break
+    
+    def build_row(values):
+        cells = "".join([f"<td style='border:1px solid black;'>{v}</td>" for v in values])
+        return f"<tr>{cells}</tr>"
+
+
+    # --- 신규행 생성 ---
+    new_rows_html=[]
+    for item in new_rows:
+        vals = [""]*hdr_cnt
+        for k,v in item.items():
+            if k in idx_map:
+                hi = idx_map[k]
+                if hi < hdr_cnt:
+                    vals[hi] = v if v is not None else ""
+        # QN_Type 강제 4번째 열 (0-index → 3)
+        if "QN_Type" in item and 3 < hdr_cnt:
+            vals[3] = item["QN_Type"]
+        log(f"[DEBUG] 신규행 데이터(FIRST): {item}")
+        new_rows_html.append(build_row(vals))
+
+    final = rows + new_rows_html
+    new_html = "<table>" + "".join(final) + "</table>"
+    log(f"[MAIL/ADD-FIRST] 신규행 추가 완료: {len(new_rows)}건")
+    return new_html
+
+def append_new_rows_second(table_html, new_rows, header_mapping):
+    """
+    두 번째 표(Q1~Q9) 신규 행 추가 (첫 번째 표 방식 동일)
+    - 기존 구조(pairs) 유지
+    - 값만 대입
+    - 공백행 추가 안 함
+    """
+    if not new_rows:
+        log("[MAIL/ADD-SECOND] 신규 행 없음")
+        return table_html
+
+    rows = re.findall(r"(?is)<tr\b.*?>.*?</tr>", table_html)
+    if not rows:
+        log("[MAIL/ADD-SECOND] 표 구조 없음")
+        return table_html
+
+    # 헤더 추출
+    hdr_cells = re.findall(r"(?is)<t[dh][^>]*>.*?</t[dh]>", rows[0])
+    hdr_cnt = len(hdr_cells)
+    log(f"[MAIL/ADD-SECOND] 헤더셀수={hdr_cnt}")
+
+    # 신규행 HTML 저장소
+    new_rows_html = []
+
+    for item in new_rows:
+        # 완전히 빈 행은 추가하지 않음
+        if not any(str(v).strip() for v in item.values()):
+            continue
+
+        # 값 매핑
+        vals = [""] * hdr_cnt
+        for key, val in item.items():
+            for i, h in enumerate(hdr_cells):
+                norm = lambda x: re.sub(r"[^a-z0-9]", "", x.lower())
+                if norm(key) in norm(h):
+                    vals[i] = sanitize_cell_value(val)
+                    break
+
+        # 기존 셀 구조 복제
+        sample_row = rows[-1] if len(rows) > 1 else rows[0]
+        pairs = re.findall(r"(?is)(<t[dh][^>]*>).*?(</t[dh]>)", sample_row)
+        filled = vals + [""] * (len(pairs) - len(vals))
+
+        new_r = "<tr>" + "".join(
+            f"{pre}{filled[i]}{post}" for i, (pre, post) in enumerate(pairs)
+        ) + "</tr>"
+        new_rows_html.append(new_r)
+
+    # 원래 표 + 신규행 결합
+    final = rows + new_rows_html
+    new_html = "<table>" + "".join(final) + "</table>"
+    log(f"[MAIL/ADD-SECOND] 신규행 추가 완료 ({len(new_rows_html)}건)")
+    return new_html
+
+
+    
+# =========================
+# QM03 상세조회 (Issue: 첫 표=Attribute, 두 표=Text)
+# =========================
+TABSTRIP_TOP          = r"wnd[0]/usr/tabsTAB_GROUP_10"
+TAB_REFERENCE_OBJECT  = r"wnd[0]/usr/tabsTAB_GROUP_10/tabp10\TAB01"
+TAB_ITEMS             = r"wnd[0]/usr/tabsTAB_GROUP_10/tabp10\TAB10"
+QN_NO_ID              = r"wnd[0]/usr/sub/1/ctxt"
+MATERIAL_TXT_DESC     = r"wnd[0]/usr/sub/1/txt[2]"
+MATERIAL_NO_DEEP      = r"wnd[0]/usr/tabsTAB_GROUP_10/tabp10\TAB01/ssub/2/3/sub/2/3/1/sub/2/3/1/1/sub/2/3/1/1/1/ctxt[0]"
+TABSTRIP_ITEMS_TAB1   = r"wnd[0]/usr/tabsTAB_GROUP_10/tabp10\TAB10/ssub/2/3/tabsTAB_GROUP_20/tabp20\TAB01"
+ITEMS_SCROLL          = r"wnd[0]/usr/tabsTAB_GROUP_10/tabp10\TAB10/ssub/2/3/tabsTAB_GROUP_20/tabp20\TAB01/ssub/2/3/1/2"
+ITEMS_TABLE_ID        = ITEMS_SCROLL + r"/tblSAPLIQS0POSITION_VIEWER"
+ITEMS_ATTR_COL        = 6
+ITEMS_TEXT_COL        = 7
+
+def _sel_tab(session, tab_id):
+    try: session.findById(tab_id).select(); time.sleep(0.15); return True
+    except: return False
+
+def _first_text(session, id_):
+    try:
+        ctl = session.findById(id_)
+        return (getattr(ctl,"text",None) or getattr(ctl,"Text",None) or "").strip() or None
+    except: return None
+
+def _get_issue(session, col_idx):
+    try: tbl = session.findById(ITEMS_TABLE_ID)
+    except: return None
+    def _get_cell(r,c):
+        try: return tbl.GetCellValue(r,c)
+        except: pass
+        for kind in ("txt","ctxt","cmb"):
+            try:
+                cell = session.findById(f"{ITEMS_TABLE_ID}/{kind}[{c},{r}]")
+                return getattr(cell,"Text",None) or getattr(cell,"text",None)
+            except: pass
+        return ""
+    for r in (0,1):
+        v = _get_cell(r, col_idx)
+        vv = ("" if v is None else str(v).strip())
+        if vv: return vv
+    return None
+
+def _get_issue_attr(session): return _get_issue(session, ITEMS_ATTR_COL)
+def _get_issue_text(session): return _get_issue(session, ITEMS_TEXT_COL)
+
+def open_qm03_same_session(session, qn):
+    ok = wait_exists(session, "wnd[0]/tbar[0]/okcd", timeout=4)
+    if not ok: return False
+    try:
+        ok.text = "/nQM03"; send_enter(session); time.sleep(0.3)
+        fld = wait_exists(session, "/app/con[0]/ses[0]/wnd[0]/usr/ctxt", timeout=3)
+        if fld:
+            fld.text = str(qn); send_enter(session); time.sleep(0.25)
+            if wait_exists(session, TABSTRIP_TOP, timeout=3): return True
+    except: return False
+    return False
+
+def get_details_for_qns_first(qn_list):
+    if not qn_list: return {}
+    ses = get_session(); out=[]
+    for qn in qn_list:
+        log(f"[QM03-First] {qn} 조회")
+        if not open_qm03_same_session(ses, qn):
+            out.append({"QN":qn,"Material":"","Issue":"","QN_Type":""}); continue
+        data={"QN":qn}
+        if _sel_tab(ses, TAB_REFERENCE_OBJECT):
+            mat_no = _first_text(ses, MATERIAL_NO_DEEP)
+            mat_all= _first_text(ses, MATERIAL_TXT_DESC)
+            data["Material"] = (mat_no or mat_all) or ""
+
+        # QN Type (ComboBox, Text)
+        try:
+            qn_type_ctrl = ses.findById("wnd[0]/usr/sub/1/sub/1/1/cmb")
+            raw_type = getattr(qn_type_ctrl, "Text", "").strip()
+            log(f"[DEBUG] QN TYPE cmb: {raw_type}")
+        except:
+            try:
+                qn_type_ctrl = ses.findById("wnd[0]/usr/sub/1/sub/1/1/txt")
+                raw_type = getattr(qn_type_ctrl, "Text", "").strip()
+                log(f"[DEBUG] QN TYPE txt: {raw_type}")
+            except:
+                raw_type = ""
+                log("[DEBUG] QN TYPE 찾기 실패")
+        
+        data["QN_Type"] = simplify_qn_type(raw_type)
+
+        
+        # Issue(Attribute) --> items가 없으면 --> description 반환
+        if _sel_tab(ses, TAB_ITEMS):
+            try: ses.findById(TABSTRIP_ITEMS_TAB1).select()
+            except: pass
+            data["Issue"] = _get_issue_attr(ses) or ""
+        out.append(data)
+    return {d["QN"]: d for d in out}
+
+def get_details_for_qns_second(qn_list):
+    if not qn_list: return {}
+    ses = get_session(); out=[]
+    for qn in qn_list:
+        log(f"[QM03-Second] {qn} 조회")
+        if not open_qm03_same_session(ses, qn):
+            log(f"[QM03-Second] 진입 실패 → Material/Issue/QN_Type 빈값")
+            out.append({"QN":qn,"Material":"","Issue":"","QN_Type":""}); continue
+
+        data={"QN":qn}
+
+        # Material
+        if _sel_tab(ses, TAB_REFERENCE_OBJECT):
+            mat_no = _first_text(ses, MATERIAL_NO_DEEP)
+            mat_all= _first_text(ses, MATERIAL_TXT_DESC)
+            data["Material"] = (mat_no or mat_all) or ""
+
+        # QN Type (ComboBox)
+        try:
+            qn_type_ctrl = ses.findById("wnd[0]/usr/sub/1/sub/1/1/cmb")
+            if qn_type_ctrl:
+                raw_type = (getattr(qn_type_ctrl, "Text", "") or "").strip()
+                data["QN_Type"] = simplify_qn_type(raw_type)
+            else:
+                data["QN_Type"] = ""
+        except Exception as e:
+            log(f"[QM03] QN_Type 추출 실패: {e}")
+            data["QN_Type"] = ""
+
+        # Issue (Text 열 → 없으면 Attribute 열 fallback --> 그래도 없으면 description 내용 가져오기)
+        issue_val = ""
+        if _sel_tab(ses, TAB_ITEMS):
+            try:
+                ses.findById(TABSTRIP_ITEMS_TAB1).select()
+            except:
+                pass
+            issue_val = _get_issue_text(ses) or _get_issue_attr(ses) or ""
+
+        # items 탭 자체가 없거나 issue 비었을 때 → Description 사용
+        if not issue_val:
+            try:
+                desc_ctrl = ses.findById("wnd[0]/usr/sub/1/txt[2]")
+                issue_val = getattr(desc_ctrl, "Text", "") or getattr(desc_ctrl, "text", "")
+                issue_val = issue_val.strip()
+            except:
+                issue_val = ""
+
+        if "2201" in issue_val:
+            issue_val = issue_val.replace("2201", "").strip()
+
+        data["Issue"] = issue_val
+        out.append(data)
+        log(f"[QM03-Second] 결과: {data}")
+
+    return {normalize_qn(d["QN"]): d for d in out}
+
+# =========================
+# ZNOT 파싱 (Note number / Task code / Elapsed)
+# =========================
+def extract_d_values_from_znot(filepath, target_qns):
+    if not os.path.isfile(filepath): 
+        log(f"[ZNOT] 파일 없음: {filepath}")
+        return []
+    with open(filepath,"r",encoding="utf-8-sig",errors="ignore") as f:
+        lines=[ln.rstrip("\r\n") for ln in f]
+    header_idx=None; headers=[]
+    for i,ln in enumerate(lines):
+        if "Note number" in ln and "Elapsed" in ln:
+            header_idx=i
+            headers=[h.replace("\xa0"," ").strip() for h in ln.split("\t") if h.strip()]
+            break
+    if header_idx is None: 
+        log("[ZNOT] 헤더 미발견")
+        return []
+    colmap = {h.lower(): idx for idx,h in enumerate(headers)}
+    def get_val(cells, key):
+        k = key.lower()
+        for name, idx in colmap.items():
+            if k in name and idx < len(cells):
+                return cells[idx]
+        return ""
+    target_set = set(str(x) for x in target_qns)
+    results=[]
+    for ln in lines[header_idx+1:]:
+        if not ln.strip(): continue
+        raw = ln.split("\t")
+        cells=[c.replace("\xa0"," ").strip() for c in raw if c.strip()]
+        if not cells: continue
+        qn = get_val(cells,"note number")
+        if not qn or qn not in target_set: continue
+        task = get_val(cells,"task code")
+        elapsed = get_val(cells,"elapsed")
+        tn = (task or "").upper().replace(" ","")
+        if tn in ("D-3C","D-5C","D-8"):
+            results.append({"QN":qn,"Task":task,"Elapsed":elapsed})
+    log(f"[ZNOT] 추출={len(results)}건 ({results[:]}) / 대상={len(target_set)}건")
+    return results
+    
+def fill_znot_into_first_table(table_html, zmap):
+    """기존 첫 번째 표에서 비어 있는 D-3C/5C/8 셀에 zmap 값 채워넣기"""
+    rows = table_rows(table_html)
+    if len(rows) < 2:
+        return table_html
+
+    hdrs = header_cells(rows[0])
+    qn_idx = find_qn_index_from_header(hdrs)
+    if qn_idx is None:
+        return table_html
+
+    def find_col(tag):
+        for i, h in enumerate(hdrs):
+            if tag.replace(" ", "") in h.upper().replace(" ", ""):
+                return i
+        return None
+
+    d3_idx = find_col("D-3C")
+    d5_idx = find_col("D-5C")
+    d8_idx = find_col("D-8")
+
+    new_rows = [rows[0]]
+    for r in rows[1:]:
+        cells = data_cells(r)
+        if not cells:
+            new_rows.append(r)
+            continue
+
+        qn = cells[qn_idx].strip() if qn_idx < len(cells) else ""
+        if not qn:
+            new_rows.append(r)
+            continue
+
+        z = zmap.get(qn, [])
+        def get_elapsed(task_tag):
+            for x in z:
+                tn = (x.get("Task") or "").upper().replace(" ", "")
+                if tn == task_tag:
+                    return x.get("Elapsed") or ""
+            return ""
+
+        vals = cells[:]
+        if d3_idx is not None and d3_idx < len(vals) and not vals[d3_idx]:
+            vals[d3_idx] = get_elapsed("D-3C")
+        if d5_idx is not None and d5_idx < len(vals) and not vals[d5_idx]:
+            vals[d5_idx] = get_elapsed("D-5C")
+        if d8_idx is not None and d8_idx < len(vals) and not vals[d8_idx]:
+            vals[d8_idx] = get_elapsed("D-8")
+
+        pairs = re.findall(r"(?is)(<t[dh][^>]*>).*?(</t[dh]>)", r)
+        cnt = min(len(vals), len(pairs))
+        new_r = "<tr>" + "".join(
+            f"{pairs[i][0]}{vals[i]}{pairs[i][1]}" for i in range(cnt)
+        ) + "</tr>"
+
+        new_rows.append(new_r)
+
+    return rebuild_table(new_rows)
+    
+# =========================
+# No. 열 재정렬 유틸 (첫 표/두 표 별도)
+# =========================
+def _renumber_table_core(table_html, data_start):
+    rows = table_rows(table_html)
+    if len(rows) <= data_start + 1:
+        return table_html
+
+    no_idx = next((i for i, h in enumerate(header_cells(rows[0])) if "no" in h.lower()), None)
+    if no_idx is None:
+        return table_html
+
+    new_rows = rows[:data_start]
+    for num, r in enumerate(rows[data_start:], start=1):
+        cells = data_cells(r)
+        if not cells:
+            continue
+        pairs = re.findall(r"(?is)(<t[dh][^>]*>).*?(</t[dh]>)", r)
+        vals = cells[:]
+        while len(vals) < no_idx + 1:
+            vals.append("")
+        vals[no_idx] = str(num)
+        new_r = "<tr>" + "".join(
+            f"{pre}{vals[i] if i < len(vals) else ''}{post}"
+            for i, (pre, post) in enumerate(pairs)
+        ) + "</tr>"
+        new_rows.append(new_r)
+
+    return rebuild_table(new_rows)
+
+def renumber_first_table(table_html):
+    """첫 번째 표 (C1~CK): 데이터 시작 행 = 3번째 (data_start=2)"""
+    return _renumber_table_core(table_html, data_start=2)
+
+def renumber_second_table(table_html):
+    """두 번째 표 (Q1~Q9): 데이터 시작 행 = 4번째 (data_start=3)"""
+    return _renumber_table_core(table_html, data_start=3)
+
+# =========================
+# outlook 메일 표 텍스트 가운데 정렬, 폰트 사이즈:10, 폰트 Aptos
+# =========================
+# Word 정렬 상수
+wdAlignParagraphCenter = 1
+wdAlignVerticalCenter  = 1
+
+def apply_final_format_to_tables():
+    """표 내용 전체를 한번에 가운데 정렬 + 맑은 고딕 10pt로 통일 (고속 적용)"""
+    ol = win32.Dispatch("Outlook.Application")
+    inspector = ol.ActiveInspector()
+    if not inspector:
+        raise RuntimeError("열려 있는 Outlook 메일창이 없습니다.")
+
+    doc = inspector.WordEditor
+    tables = doc.Tables
+    if tables.Count < 1:
+        log("⚠ 표가 없습니다. 본문 전체 서식은 건너뜁니다.")
+        return
+
+    for i in range(1, tables.Count + 1):
+        tbl = tables.Item(i)
+        rng = tbl.Range
+
+        # 🔹 표 전체 폰트 한번에 적용
+        rng.Font.Name = "맑은 고딕"
+        rng.Font.Size = 10
+
+        # 🔹 가로 가운데 정렬 한번에 적용
+        rng.ParagraphFormat.Alignment = wdAlignParagraphCenter
+
+        # 🔹 세로 가운데 정렬은 표 전체 속성으로 설정
+        tbl.Rows.Alignment = 0  # 표 자체는 왼쪽 정렬 유지
+        tbl.Range.Cells.VerticalAlignment = wdAlignVerticalCenter
+
+    log("✅ 표 전체 단위로 가운데 정렬 + 맑은 고딕 10pt 적용 완료 (고속 모드)")
+
+
+# =========================
+# Outlook 표 스타일 적용 ("표 눈금 밝게")
+# =========================
+def apply_table_nungum_style_to_all_tables():
+    """
+    Word(Outlook) 표 스타일 중 '표 눈금 밝게' (Table Grid Light)를
+    모든 표에 일괄 적용.
+    """
+    ol = win32.Dispatch("Outlook.Application")
+    inspector = ol.ActiveInspector()
+    if not inspector:
+        raise RuntimeError("열려 있는 Outlook 메일창이 없습니다.")
+    doc = inspector.WordEditor
+
+    # 스타일 이름 후보 (한글/영문 혼용 환경 대응)
+    candidates = ["표 눈금 밝게", "Table Grid Light", "Table Grid", "표 격자"]
+
+    # 스타일 이름 탐색
+    def _resolve_style(doc, names):
+        for n in names:
+            try:
+                _ = doc.Styles(n)
+                return n
+            except:
+                try:
+                    _ = doc.Styles(n).NameLocal
+                    return n
+                except:
+                    continue
+        return None
+
+    style_name = _resolve_style(doc, candidates)
+    if not style_name:
+        log("⚠ 표 스타일 '표 눈금 밝게'를 찾지 못해 기본 유지.")
+        return
+
+    app = doc.Application
+    try:
+        prev = app.ScreenUpdating
+        app.ScreenUpdating = False
+    except:
+        prev = True
+
+    count = 0
+    for t in doc.Tables:
+        try:
+            t.Style = style_name
+            count += 1
+        except Exception as e:
+            log(f"[WARN] 표 스타일 적용 실패: {e}")
+
+    try:
+        app.ScreenUpdating = prev
+    except:
+        pass
+
+    log(f"✅ '{style_name}' 스타일 {count}개 표에 적용 완료.")
+
+#색상 조건            
+def rgb(r,g,b):
+    return r + (g << 8) + (b << 16)
+
+def apply_table_color_rules():
+    """첫 번째 표에서 Elapsed time 행 제외 후
+       D-3C/D-5C/D-8 은 조건부 색상 적용,
+       '이슈 내용'(6번째 열)은 무조건 색상 제거
+    """
+    ol = win32.Dispatch("Outlook.Application")
+    inspector = ol.ActiveInspector()
+    if not inspector:
+        raise RuntimeError("열려있는 Outlook 메일창이 없습니다.")
+
+    doc = inspector.WordEditor
+    tables = doc.Tables
+    if tables.Count < 1:
+        raise RuntimeError("메일에 표가 없습니다.")
+
+    tbl = tables.Item(1)
+
+    # 헤더 텍스트 읽기
+    headers = [tbl.Cell(1, c).Range.Text.strip().replace("\r","").replace("\x07","") 
+               for c in range(1, tbl.Columns.Count+1)]
+
+    idx_d3  = next((i+1 for i,h in enumerate(headers) if "D-3C" in h.upper()), None)
+    idx_d5  = next((i+1 for i,h in enumerate(headers) if "D-5C" in h.upper()), None)
+    idx_d8  = next((i+1 for i,h in enumerate(headers) if "D-8"  in h.upper()), None)
+
+    green_bg = rgb(226,239,217)
+    red_bg   = rgb(251,228,213)
+
+    issue_col = 6  # '이슈 내용' 열 고정
+
+    # 데이터 시작 행 = 3 (1=헤더, 2=Elapsed time)
+    for r in range(3, tbl.Rows.Count+1):
+        # --- 조건부 색상: D-3C, D-5C, D-8 ---
+        for (idx, threshold) in [(idx_d3,1), (idx_d5,5), (idx_d8,20)]:
+            if idx:
+                cell = tbl.Cell(r, idx)
+                val = cell.Range.Text.strip().replace("\r","").replace("\x07","")
+                cell.Shading.BackgroundPatternColor = green_bg
+                try:
+                    if float(val) >= threshold:
+                        cell.Shading.BackgroundPatternColor = red_bg
+                except:
+                    pass
+
+        # --- 이슈 내용 열은 무조건 흰색으로 덮어쓰기 ---
+        if issue_col <= tbl.Columns.Count:
+            try:
+                tbl.Cell(r, issue_col).Shading.BackgroundPatternColor = 16777215
+            except Exception:
+                pass
+
+    log("✅ 색상 규칙 적용 완료 (D-3C/5C/8 조건부, 이슈내용 열 색상 제거)")
+
+
+def apply_final_table_styles_then_colors():
+    """
+    1️⃣ 모든 표에 '표 눈금 밝게' 스타일 적용
+    2️⃣ 첫 번째 표에 색상 규칙 적용
+    3️⃣ 모든 표에 가운데정렬·폰트·사이즈 적용
+    """
+    apply_table_nungum_style_to_all_tables()
+    apply_table_color_rules()
+    apply_final_format_to_tables()
+
+
+# -----------------------------------------
+# 1️⃣ 셀 내부 값 정리 (숨은 공백/개행/NBSP 제거)
+# -----------------------------------------
+_WS_ZEROWIDTH = ("\u200b", "\u200c", "\u200d", "\ufeff")
+
+def sanitize_cell_value(v: object) -> str:
+    """셀 내부 문자열에서 Outlook이 오인식하는 공백/개행/제로폭 제거"""
+    s = "" if v is None else str(v)
+    for z in _WS_ZEROWIDTH:
+        s = s.replace(z, "")
+    s = (
+        s.replace("\xa0", " ")   # NBSP → 일반 space
+         .replace("\t", " ")
+         .replace("\r", "")
+         .replace("\n", "")
+    )
+    return s.strip()
+
+
+# -----------------------------------------
+# 2️⃣ Outlook HTML 최종 정리
+# -----------------------------------------
+def finalize_outlook_html(new_html: str) -> str:
+    """
+    Outlook용 HTML 최종 정리:
+    - table-layout 고정 (자동 폭 계산 방지)
+    - 태그 사이 불필요한 공백 제거
+    """
+    def lock_table(tag: str) -> str:
+        if 'style=' in tag:
+            return re.sub(
+                r'style=["\']',
+                "style='table-layout:fixed;border-collapse:collapse; ",
+                tag,
+                count=1
+            )
+        return tag.replace("<table", "<table style='table-layout:fixed;border-collapse:collapse'")
+    new_html = re.sub(r"(?is)<table\b[^>]*>", lambda m: lock_table(m.group(0)), new_html)
+    new_html = re.sub(r">\s+<", "><", new_html)
+    return new_html
+
+
+# -----------------------------------------
+# 3️⃣ 첫 번째/두 번째 표 값만 정리 (스타일 보존)
+# -----------------------------------------
+def sanitize_table_cells_preserve_structure(table_html: str) -> str:
+    """<td>/<th> 내부 텍스트만 정리, HTML 구조와 스타일은 그대로 유지"""
+    pattern = r"(?is)(<t[dh][^>]*>)(.*?)(</t[dh]>)"
+
+    def clean_cell(m):
+        open_tag, content, close_tag = m.groups()
+        clean_text = sanitize_cell_value(re.sub(r"(?is)<.*?>", "", content))
+        return f"{open_tag}{clean_text}{close_tag}"
+
+    return re.sub(pattern, clean_cell, table_html)
+
+
+# -----------------------------------------
+# 4️⃣ 두 번째 표(Q1~Q9) 전용 안정화 보정
+# -----------------------------------------
+def sanitize_table_second(table_html: str) -> str:
+    """
+    두 번째 표(Q1~Q9) 전용 정리 (최종 안정화 버전)
+    - 셀 내부 텍스트의 숨은 공백/제로폭 문자 제거
+    - 실제 헤더 열 수에 맞춰 정확히 <td> 개수 유지
+    - 초과 셀은 버리고, 부족하면 <td></td>로 채움 (보더 없음)
+    - 기존 스타일/링크/정렬은 유지
+    """
+    if not table_html:
+        return table_html
+
+    # 1️⃣ 셀 내부 텍스트 정리
+    pattern = r"(?is)(<t[dh][^>]*>)(.*?)(</t[dh]>)"
+    def clean_cell(m):
+        open_tag, content, close_tag = m.groups()
+        clean_text = sanitize_cell_value(re.sub(r"(?is)<.*?>", "", content))
+        return f"{open_tag}{clean_text}{close_tag}"
+    cleaned_html = re.sub(pattern, clean_cell, table_html)
+
+    # 2️⃣ 행 추출
+    rows = re.findall(r"(?is)<tr\b.*?>.*?</tr>", cleaned_html)
+    if not rows:
+        return cleaned_html
+    
+    # 3️⃣ 헤더 기준 
+    header_cells = [
+        c for c in re.findall(r"(?is)<t[dh]\b[^>]*>.*?</t[dh]>", rows[0])
+        if strip_html(c).strip() not in ("", "&nbsp;")
+    ]
+    hdr_cnt = len(header_cells)
+    if hdr_cnt == 0:
+        # ✅ 혹시 헤더가 비어있다면, 두 번째 행에서라도 기준 잡기
+        for r in rows[1:]:
+            tmp = re.findall(r"(?is)<t[dh]\b[^>]*>.*?</t[dh]>", r)
+            if tmp:
+                header_cells = tmp
+                hdr_cnt = len(tmp)
+                break
+    if hdr_cnt == 0:
+        return cleaned_html
+
+    fixed_rows = []
+    for i, r in enumerate(rows):
+        cells = re.findall(r"(?is)<t[dh]\b[^>]*>.*?</t[dh]>", r)
+        c_count = len(cells)
+
+        # 헤더 행은 그대로 유지
+        if i == 0:
+            fixed_rows.append(r)
+            continue
+
+        # 데이터 행만 정규화
+        if c_count < hdr_cnt:
+            # 부족하면 <td></td>로 채움
+            for _ in range(hdr_cnt - c_count):
+                cells.append("<td></td>")
+        elif c_count > hdr_cnt:
+            # ✅ 초과 셀은 버리되 로그 남기기
+            log(f"[WARN] 행 {i}에 헤더보다 {c_count - hdr_cnt}개 많은 셀 감지 → 잘라냄")
+            cells = cells[:hdr_cnt]
+
+        fixed_rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    fixed_html = "<table>" + "".join(fixed_rows) + "</table>"
+    fixed_html = finalize_outlook_html(fixed_html)
+    return fixed_html
+
+def normalize_qn(qn):
+    """QN 값 내 숨은 공백, 제로폭 문자 제거 + 문자열 통일"""
+    if qn is None:
+        return ""
+    s = str(qn)
+    for z in ("\u200b", "\u200c", "\u200d", "\ufeff", "\xa0"):
+        s = s.replace(z, "")
+    return s.strip()
+
+def safe_get(d, *keys):
+    """키 이름 불일치 방지를 위한 안전 접근기"""
+    if not d:
+        return ""
+    # 우선 순위대로 직접 시도
+    for k in keys:
+        if k in d:
+            return d[k]
+    # 정규화된 키 매칭 (공백/언더바/대소문자 무시)
+    dn = {re.sub(r"[^a-z0-9]", "", k.lower()): v for k, v in d.items()}
+    for k in keys:
+        nk = re.sub(r"[^a-z0-9]", "", k.lower())
+        if nk in dn:
+            return dn[nk]
+    return ""
+
+def _norm_header(s: str) -> str:
+    import re
+    s = "" if s is None else str(s)
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff\xa0]", "", s)  # 제로폭/NBSP 제거
+    return re.sub(r"\s+", "", s).lower()  # 공백 제거 + 소문자
+
+
+def build_first_mail_from_files(day):
+    """보낸편지함에 QN 메일이 없을 때, SAP Export 파일만으로 초기 메일 생성 (본문=표 2개만)"""
+    log(f"[INIT] 초기 메일 빌드 시작 ({day})")
+
+    # 1) 필요한 파일 확보
+    ensure_files_for_test_date(day)
+    f_first  = path_first(day)
+    f_second = path_second(day)
+    f_znot   = path_znot(day)
+
+    # 2) 파싱
+    rows_first  = parse_export_txt(f_first,  anchor_qn=None) if os.path.isfile(f_first)  else []
+    rows_second = parse_export_txt(f_second, anchor_qn=None) if os.path.isfile(f_second) else []
+
+    # 3) 상세조회 (기존 함수 사용)
+    detail_map_first  = get_details_for_qns_first([r["QN"] for r in rows_first])   if rows_first  else {}
+    detail_map_second = get_details_for_qns_second([r["QN"] for r in rows_second]) if rows_second else {}
+
+    # 4) 헤더(누락 보완) + 공통 셀 스타일
+    hdrs_first  = ["No.", "등록일", "QN #", "QN TYPE", "품번", "이슈 내용", "D-3C", "D-5C", "D-8"]
+    hdrs_second = ["No.", "등록일", "QN #", "QN TYPE", "품번", "이슈 내용"]
+    base_style = "font-family:'Malgun Gothic'; font-size:10pt; text-align:center;"
+
+    header_html_first  = "".join(f"<th style='{base_style}'>{h}</th>" for h in hdrs_first)
+    header_html_second = "".join(f"<th style='{base_style}'>{h}</th>" for h in hdrs_second)
+
+    # 5) 첫 번째 표 행
+    rows_html_first = []
+    for i, r in enumerate(rows_first, start=1):
+        qn = r.get("QN", "")
+        d  = detail_map_first.get(qn, {})
+        vals = [
+            str(i),
+            sanitize_cell_value(r.get("Created", "")),
+            sanitize_cell_value(qn),
+            sanitize_cell_value(d.get("QN_Type", "")),
+            sanitize_cell_value(d.get("Material", "")),
+            sanitize_cell_value(d.get("Issue", "")),
+            "", "", "",  # D-3C/5C/8은 ZNOT로 채움
+        ]
+        rows_html_first.append("<tr>" + "".join(f"<td style='{base_style}'>{v}</td>" for v in vals) + "</tr>")
+
+    table_first = f"""
+    <table style='border-collapse:collapse; table-layout:fixed; border:1px solid #ccc;
+                  margin-left:auto; margin-right:auto; font-family:"Malgun Gothic"; font-size:10pt;'>
+        <tr>{header_html_first}</tr>
+        {''.join(rows_html_first)}
+    </table>
+    """
+
+    # 5.5) ZNOT 보강 (기존 로직 재사용)
+    try:
+        if os.path.isfile(f_znot) and rows_first:
+            qns_first = [r["QN"] for r in rows_first]
+            z_rows = extract_d_values_from_znot(f_znot, qns_first)
+            zmap = {}
+            for zr in z_rows:
+                zmap.setdefault(zr["QN"], []).append({
+                    "Task": zr.get("Task", ""),
+                    "Elapsed": zr.get("Elapsed", "")
+                })
+            table_first = fill_znot_into_first_table(table_first, zmap)
+            log(f"[INIT] ZNOT 병합 완료: 대상={len(qns_first)}건 / 추출={len(z_rows)}건")
+    except Exception as e:
+        log(f"[INIT][WARN] ZNOT 병합 중 오류: {e}")
+
+    # 6) 두 번째 표 행
+    rows_html_second = []
+    for i, r in enumerate(rows_second, start=1):
+        qn = r.get("QN", "")
+        d  = detail_map_second.get(qn, {})
+        vals = [
+            str(i),
+            sanitize_cell_value(r.get("Created", "")),
+            sanitize_cell_value(qn),
+            sanitize_cell_value(d.get("QN_Type", "")),
+            sanitize_cell_value(d.get("Material", "")),
+            sanitize_cell_value(d.get("Issue", "")),
+        ]
+        rows_html_second.append("<tr>" + "".join(f"<td style='{base_style}'>{v}</td>" for v in vals) + "</tr>")
+
+    table_second = f"""
+    <table style='border-collapse:collapse; table-layout:fixed; border:1px solid #ccc;
+                  margin-top:10px; margin-left:auto; margin-right:auto;
+                  font-family:"Malgun Gothic"; font-size:10pt;'>
+        <tr>{header_html_second}</tr>
+        {''.join(rows_html_second)}
+    </table>
+    """
+
+    # 7) 메일 생성 (본문 = 표 2개만)
+    outlook = win32.Dispatch("Outlook.Application")
+    mail = outlook.CreateItem(0)
+    mail.Subject = f"{day.month}/{day.day} QN 등록 현황 공유"
+    mail.To = "ByungJin.Hong@molex.com; JoonYong.Son@molex.com; YongHyuk.Ahn@molex.com"
+    mail.HTMLBody = f"<html><body>{table_first}<br><br>{table_second}</body></html>"
+    mail.Display()
+
+    # 8) 스타일 적용 (기존 함수 사용)
+    try:
+        apply_table_nungum_style_to_all_tables()
+        apply_table_color_rules_initial()
+        apply_final_format_to_tables()
+        log("✅ [INIT] 초기 전용 스타일(눈금→색상→정렬) 적용 완료")
+    except Exception as e:
+        log(f"[INIT] 스타일 적용 중 오류: {e}")
+
+
+
+def apply_table_color_rules_initial():
+    """첫 번째 표에서 2행(헤더 바로 아래)부터
+       D-3C/D-5C/D-8 은 조건부 색상 적용,
+       '이슈 내용'(6번째 열)은 무조건 흰색으로 초기화
+    """
+    ol = win32.Dispatch("Outlook.Application")
+    inspector = ol.ActiveInspector()
+    if not inspector:
+        raise RuntimeError("열려있는 Outlook 메일창이 없습니다.")
+
+    doc = inspector.WordEditor
+    tables = doc.Tables
+    if tables.Count < 1:
+        raise RuntimeError("메일에 표가 없습니다.")
+
+    tbl = tables.Item(1)
+
+    # --- 헤더 읽기 ---
+    headers = [
+        tbl.Cell(1, c).Range.Text.replace("\r", "").replace("\x07", "").strip()
+        for c in range(1, tbl.Columns.Count + 1)
+    ]
+
+    # --- 열 인덱스 찾기 ---
+    def find_col(key):
+        key = key.upper().replace(" ", "")
+        for i, h in enumerate(headers):
+            if key in h.upper().replace(" ", ""):
+                return i + 1
+        return None
+
+    idx_d3 = find_col("D-3C")
+    idx_d5 = find_col("D-5C")
+    idx_d8 = find_col("D-8")
+    issue_col = 6  # '이슈 내용' 열
+
+    # --- 색상 정의 ---
+    def rgb(r, g, b): return r + (g << 8) + (b << 16)
+    green_bg = rgb(226, 239, 217)
+    red_bg = rgb(251, 228, 213)
+    white_bg = rgb(255, 255, 255)
+
+    # ✅ 데이터 시작 행 = 2 (헤더 바로 아래부터)
+    for r in range(2, tbl.Rows.Count + 1):
+        # 조건부 색상: D-3C / D-5C / D-8
+        for (idx, threshold) in [(idx_d3, 1), (idx_d5, 5), (idx_d8, 20)]:
+            if idx:
+                cell = tbl.Cell(r, idx)
+                val = cell.Range.Text.replace("\r", "").replace("\x07", "").strip()
+                cell.Shading.BackgroundPatternColor = green_bg
+                try:
+                    if float(val) >= threshold:
+                        cell.Shading.BackgroundPatternColor = red_bg
+                except:
+                    pass
+
+        # '이슈 내용' 열은 무조건 흰색으로 덮기
+        if issue_col <= tbl.Columns.Count:
+            try:
+                tbl.Cell(r, issue_col).Shading.BackgroundPatternColor = white_bg
+            except:
+                pass
+
+    log("✅ [INIT] 색상 규칙 적용 완료 (2행부터, D-3C/5C/8 조건부 + 이슈내용 열 흰색)")
+
+
+#=============================================================통계 및 본문내용 작성====================================================
+def safe_float(s):
+    """문자열에서 숫자만 추출해 float으로 변환"""
+    if not s:
+        return None
+    try:
+        s = str(s).strip().replace(",", ".")
+        return float(re.sub(r"[^0-9.]", "", s))
+    except:
+        return None
+
+
+###############################################################################
+# Outlook 메일의 첫 번째 표(C1~Ck, 2줄 헤더 구조) 통계 계산
+###############################################################################
+def parse_first_table_C1Ck_2row_header():
+    outlook = win32.Dispatch("Outlook.Application")
+    insp = outlook.ActiveInspector()
+    if insp is None:
+        raise RuntimeError("현재 열려 있는 Outlook 메일이 없습니다.")
+    mail = insp.CurrentItem
+    doc = mail.GetInspector.WordEditor
+
+    # ✅ 첫 번째 표 선택
+    tbl = doc.Tables(1)
+    rows = tbl.Rows.Count
+    cols = tbl.Columns.Count
+    print(f"[INFO] 첫 번째 표(C1~Ck): {rows}행 × {cols}열")
+
+    # 상단 2행 헤더 → 실제 헤더 이름은 1행에서 가져오기
+    headers = []
+    for c in range(1, cols + 1):
+        try:
+            # 1행 텍스트 (No., 등록일, QN # 등)
+            top_text = tbl.Cell(1, c).Range.Text.replace("\r", "").replace("\x07", "").strip()
+            headers.append(top_text)
+        except:
+            headers.append("")
+    print(f"[INFO] 1행 헤더 감지: {headers}")
+
+    # 열 인덱스 찾기
+    def find_col(keyword):
+        for i, h in enumerate(headers):
+            if keyword.lower() in h.lower():
+                return i + 1
+        return None
+
+    idx_qn = find_col("qn") or find_col("QN #")
+    idx_d3 = find_col("d-3c")
+    idx_d5 = find_col("d-5c")
+    idx_d8 = find_col("d-8")
+
+    if not all([idx_qn, idx_d3, idx_d5, idx_d8]):
+        raise RuntimeError("필수 열(QN, D-3C, D-5C, D-8)을 찾지 못했습니다.")
+
+    total = 0
+    sat_d3 = sat_d5 = sat_d8 = 0
+
+    # 데이터 시작 행 자동 판별
+    # 2행 전체 텍스트를 합쳐서 'elapsed time' 포함 여부 확인
+    second_row_text = ""
+    try:
+        second_row_text = "".join(
+            tbl.Cell(2, c).Range.Text.replace("\r", "").replace("\x07", "").lower()
+            for c in range(1, tbl.Columns.Count + 1)
+        )
+    except:
+        pass
+
+    # Elapsed time 존재 여부에 따라 데이터 시작 행 결정
+    data_start_row = 3 if "elapsed" in second_row_text else 2
+
+    # 데이터 행 처리
+    for r in range(data_start_row, rows + 1):
+        try:
+            qn = tbl.Cell(r, idx_qn).Range.Text.replace("\r", "").replace("\x07", "").strip()
+            val_d3 = safe_float(tbl.Cell(r, idx_d3).Range.Text)
+            val_d5 = safe_float(tbl.Cell(r, idx_d5).Range.Text)
+            val_d8 = safe_float(tbl.Cell(r, idx_d8).Range.Text)
+
+            if not qn or qn.lower() == "elapsed time":
+                continue
+
+            total += 1
+            print(f"[ROW] QN={qn} | D-3C={val_d3} | D-5C={val_d5} | D-8={val_d8}")
+
+            if val_d3 is not None and val_d3 < 1:
+                sat_d3 += 1
+            if val_d5 is not None and val_d5 < 5:
+                sat_d5 += 1
+            if val_d8 is not None and val_d8 < 20:
+                sat_d8 += 1
+        except Exception as e:
+            print(f"[WARN] {r}행 처리 실패: {e}")
+            continue
+
+
+    print("\n=== 통계 요약 ===")
+    print(f"총 건수: {total}")
+    print(f"D-3C 만족: {sat_d3} / {total}")
+    print(f"D-5C 만족: {sat_d5} / {total}")
+    print(f"D-8 만족: {sat_d8} / {total}")
+
+    return mail, total, sat_d3, sat_d5, sat_d8
+
+
+def append_summary_in_mail(mail, total, sat_d3, sat_d5, sat_d8):
+    html = mail.HTMLBody or ""
+
+    # ────────────────────────────────
+    # 모든 표 추출 (보존)
+    # ────────────────────────────────
+    tables = re.findall(r"(?is)(<table.*?</table>)", html)
+
+    # ────────────────────────────────
+    # 상단 신규 블록 생성
+    # ────────────────────────────────
+    date_str = f"{TEST_DATE.year}년 {TEST_DATE.month}월 {TEST_DATE.day}일"
+    header_html = (
+        f"<div style='font-family:\"Malgun Gothic\"; font-size:10pt; margin:6px 0;'>"
+        f"{date_str} QN 등록 현황 공유 드립니다.<br>"
+        f"현재까지 QN은 총 <b>{total}</b>건입니다."
+        f"</div><br>"
+        f"<div style='font-family:\"Malgun Gothic\"; font-size:10pt; margin:6px 0;'>"
+        f"<b>QN 입력 시간 분석 결과</b><br>"
+        f"D-3C (Within 1day): {sat_d3}건 / {total}건 ({sat_d3/total*100:.1f}%)<br>"
+        f"D-5C (Within 5days): {sat_d5}건 / {total}건 ({sat_d5/total*100:.1f}%)<br>"
+        f"D-8 (Within 20days): {sat_d8}건 / {total}건 ({sat_d8/total*100:.1f}%)"
+        f"</div><hr>"
+    )
+
+    # ────────────────────────────────
+    # 표 위/아래 문장 구성
+    # ────────────────────────────────
+    new_body = header_html
+
+    if len(tables) >= 1:
+        new_body += (
+            "<p style='font-family:\"Malgun Gothic\"; font-size:12pt; font-weight:bold;'>"
+            "Notification Type C1-CK</p>" + tables[0]
+        )
+    if len(tables) >= 2:
+        new_body += (
+            "<p style='font-family:\"Malgun Gothic\"; font-size:12pt; font-weight:bold;'>"
+            "Notification Type Q1-Q9</p>" + tables[1] +
+            "<p style='font-family:\"Malgun Gothic\"; font-size:10pt;'>이상입니다.</p>"
+        )
+
+    # 나머지 표 (3번째 이후)는 원래 순서대로 유지
+    if len(tables) > 2:
+        for t in tables[2:]:
+            new_body += t
+
+
+    # ────────────────────────────────
+    # 메일 본문 반영
+    # ────────────────────────────────
+    mail.HTMLBody = new_body
+
+# =========================
+# 메인 파이프라인 (TEST_DATE 기준)
+# =========================
+def main():
+    print("[DEBUG] main() 진입")
+    day = TEST_DATE
+    EXPORT_DIR = CONFIG["EXPORT_DIR"]
+
+    # =========================
+    # 🔍 가장 최근 저장된 파일 탐색 함수
+    # =========================
+    def find_latest_existing_file(base_dir, file_type="first", before_date=None):
+        """
+        지정 폴더에서 가장 최근 저장된 파일 경로를 반환
+        - file_type: "first" → YYYYMMDD.txt 형식
+                      "second" → YYYYMMDD_Q1.txt 형식
+        - before_date: 오늘 날짜 이전 파일만 검색
+        """
+        pattern = r"(\d{8})(?:_Q1)?\.txt$"  # YYYYMMDD or YYYYMMDD_Q1
+        all_files = os.listdir(base_dir)
+        candidates = []
+        for fn in all_files:
+            m = re.match(pattern, fn)
+            if not m:
+                continue
+
+            # 파일명 규칙 필터링
+            if file_type == "first" and "_Q1" in fn:
+                continue
+            if file_type == "second" and "_Q1" not in fn:
+                continue
+
+            try:
+                fdate = dt.datetime.strptime(m.group(1), "%Y%m%d").date()
+            except:
+                continue
+
+            if before_date and fdate >= before_date:
+                continue
+            candidates.append((fdate, fn))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        latest_file = os.path.join(base_dir, candidates[0][1])
+        return latest_file
+
+    # =========================
+    # 0) SAP 접속 → 오늘 기준 파일 보장
+    # =========================
+    ensure_files_for_test_date(day)
+
+    # =========================
+    # 🔍 비교용 파일 자동 탐색
+    # =========================
+    latest_first_path  = find_latest_existing_file(EXPORT_DIR, "first", before_date=day)
+    latest_second_path = find_latest_existing_file(EXPORT_DIR, "second", before_date=day)
+
+    f_first_prev  = latest_first_path  if latest_first_path  else None
+    f_second_prev = latest_second_path if latest_second_path else None
+
+    log(f"[INFO] 최근 저장 파일: 표1={latest_first_path} / 표2={latest_second_path}")
+
+    # =========================
+    # 1) 메일 원본 확보
+    # =========================
+    src = None
+    if USE_ACTIVE_MAIL_FIRST:
+        src = get_active_mail()
+        if src:
+            log(f"[MAIL] 활성 메일 사용: {src.Subject}")
+    
+    if not src:
+        src = find_latest_qn_mail_before_date(day)
+        if not src:
+            # 기존 코드: raise RuntimeError(...)
+            log("[MAIL] QN 관련 메일이 존재하지 않음 → 초기 설정 모드 실행")
+            build_first_mail_from_files(day)
+            return  # 초기 모드에서는 나머지 파이프라인 건너뜀
+
+    src_date = (src.SentOn.date() if hasattr(src, "SentOn") and src.SentOn else day)
+    html = src.HTMLBody or ""
+    tables = get_tables(html)
+    if len(tables) < 2:
+        raise RuntimeError("메일에 표가 2개 미만입니다.")
+
+    # =========================
+    # 2) 첫/두 번째 표에서 앵커 QN 추출
+    # =========================
+    last_qn_first  = extract_last_qn_from_table(tables[0])
+    last_qn_second = extract_last_qn_from_table(tables[1])
+    log(f"[ANCHOR] First(last)={last_qn_first} / Second(last)={last_qn_second}")
+
+    # =========================
+    # 3) 오늘자 파일 경로
+    # =========================
+    f_first_day   = path_first(day)
+    f_second_day  = path_second(day)
+    f_znot_day    = path_znot(day)
+
+    # =========================
+    # 4) 신규/삭제 계산
+    # =========================
+    new_rows_first  = parse_export_txt(f_first_day,  last_qn_first)
+    new_rows_second = parse_export_txt(f_second_day, last_qn_second)
+    log(f"[NEW] 첫표 신규={len(new_rows_first)} (예: {new_rows_first[:5]})")
+    log(f"[NEW] 두표 신규={len(new_rows_second)} (예: {new_rows_second[:5]})")
+
+    deleted_first = []
+    deleted_second = []
+
+    if f_first_prev and os.path.isfile(f_first_prev):
+        deleted_first = detect_deleted(f_first_prev, f_first_day)
+    else:
+        log("[WARN] 첫 번째 표 비교 대상 파일 없음 → 삭제 QN 계산 생략")
+
+    if f_second_prev and os.path.isfile(f_second_prev):
+        deleted_second = detect_deleted(f_second_prev, f_second_day)
+    else:
+        log("[WARN] 두 번째 표 비교 대상 파일 없음 → 삭제 QN 계산 생략")
+
+    # =========================
+    # 5) 신규 QN 상세 조회(QM03)
+    # =========================
+    detail_map_first  = get_details_for_qns_first([r["QN"] for r in new_rows_first])   if new_rows_first  else {}
+    detail_map_second = get_details_for_qns_second([r["QN"] for r in new_rows_second]) if new_rows_second else {}
+    detail_map = {**detail_map_first, **detail_map_second}
+
+    # =========================
+    # 6) ZNOT 보강
+    # =========================
+    def blank_qns_first(table_html):
+        rows = table_rows(table_html)
+        if len(rows) < 2:
+            return []
+        hdrs = header_cells(rows[0])
+        dcols = []
+        for i, h in enumerate(hdrs):
+            H = h.upper().replace(" ", "")
+            if any(tag in H for tag in ("D-3C", "D-5C", "D-8")):
+                dcols.append(i)
+        qn_idx = find_qn_index_from_header(hdrs)
+        if qn_idx is None:
+            return []
+        blanks = []
+        for r in rows[1:]:
+            cells = data_cells(r)
+            if qn_idx >= len(cells):
+                continue
+            qn = cells[qn_idx].strip()
+            if not qn:
+                continue
+            if any(ci < len(cells) and cells[ci] == "" for ci in dcols):
+                blanks.append(qn)
+        return blanks
+
+    blanks = blank_qns_first(tables[0])
+    target_for_znot = set(blanks) | set([r["QN"] for r in new_rows_first])
+    znot_rows = extract_d_values_from_znot(f_znot_day, list(target_for_znot)) if target_for_znot else []
+    zmap = {}
+    for r in znot_rows:
+        zmap.setdefault(r["QN"], []).append({"Task": r["Task"], "Elapsed": r["Elapsed"]})
+
+    # =========================
+    # 7) 메일 복제 및 표 업데이트
+    # =========================
+    outlook = win32.Dispatch("Outlook.Application")
+    mapi = outlook.GetNamespace("MAPI")
+
+    # --- Outbox → Drafts 이동 ---
+    outbox = mapi.GetDefaultFolder(4)
+    drafts = mapi.GetDefaultFolder(16)
+    outbox_items = outbox.Items
+    move_count = 0
+    for i in range(outbox_items.Count, 0, -1):
+        item = outbox_items.Item(i)
+        if getattr(item, "Class", None) != 43:
+            continue
+        subj = getattr(item, "Subject", "")
+        if MAIL_SUBJECT_KEY in subj:
+            try:
+                item.Move(drafts)
+                move_count += 1
+            except Exception as e:
+                log(f"[OUTBOX→DRAFTS 이동 실패] {subj}: {e}")
+    log(f"[CLEANUP] Outbox → Drafts 이동 완료: {move_count}건")
+
+    # --- Drafts 내 동일 제목 메일 삭제 ---
+    drafts_items = drafts.Items
+    del_count = 0
+    for i in range(drafts_items.Count, 0, -1):
+        item = drafts_items.Item(i)
+        if getattr(item, "Class", None) != 43:
+            continue
+        subj = getattr(item, "Subject", "")
+        if MAIL_SUBJECT_KEY in subj:
+            try:
+                item.Delete()
+                del_count += 1
+            except Exception as e:
+                log(f"[DRAFTS 삭제 실패] {subj}: {e}")
+    log(f"[CLEANUP] Drafts 내 '{MAIL_SUBJECT_KEY}' 삭제 완료: {del_count}건")
+
+    # --- 새 메일 생성 ---
+    new_mail = outlook.CreateItem(0)
+    new_subject = replace_date_in_subject(src.Subject, src_date, day)
+    new_html = replace_date_in_body(html, src_date, day)
+
+    new_mail.Subject = new_subject
+    new_mail.HTMLBody = new_html
+    new_mail.To = (
+        "Byungjin.Hong@molex.com; "
+        "JoonYong.Son@molex.com; "
+        "YongHyuk.Ahn@molex.com; "
+        "myeongjun.kim@molex.com " )
+    new_mail.Display()
+    log("[MAIL] 새 메일 창 표시(원본 스타일 복제 + 날짜 치환)")
+
+    # =========================
+    # 8) 표 업데이트 (삭제 + 신규 + 색상)
+    # =========================
+    cur_html = new_mail.HTMLBody or ""
+    cur_tables = get_tables(cur_html)
+    if len(cur_tables) < 2:
+        raise RuntimeError("복제된 메일에서 표 2개를 찾지 못했습니다.")
+
+    # --- 첫 번째 표 ---
+    t1 = cur_tables[0]
+    t1_updated, removed1 = remove_deleted_from_table(t1, deleted_first)
+    header_map_first = {
+        "Created": "등록일",
+        "QN": "QN #",
+        "QN_Type": "QN TYPE",
+        "Material": "품번",
+        "Issue": ["이슈 내용", "이슈", "이슈내용"],
+        "D3C": "D-3C",
+        "D5C": "D-5C",
+        "D8": "D-8",
+    }
+    new_rows_for_mail_1 = []
+    for r in new_rows_first:
+        qn = r.get("QN", "")
+        d  = detail_map.get(qn, {})
+        z  = zmap.get(qn, [])
+    
+        # ZNOT에서 D-3C/5C/8 찾아서 값 매핑
+        d3 = next((x["Elapsed"] for x in z if (x.get("Task") or "").upper().replace(" ", "") == "D-3C"), "")
+        d5 = next((x["Elapsed"] for x in z if (x.get("Task") or "").upper().replace(" ", "") == "D-5C"), "")
+        d8 = next((x["Elapsed"] for x in z if (x.get("Task") or "").upper().replace(" ", "") == "D-8"),  "")
+    
+        new_rows_for_mail_1.append({
+            "QN": qn,
+            "QN_Type": d.get("QN_Type", ""),
+            "Material": d.get("Material", ""),
+            "Issue": d.get("Issue", ""),
+            "Created": r.get("Created", ""),
+            "D3C": d3, "D5C": d5, "D8": d8,  # ✅ 여기가 핵심
+        })
+
+    t1_updated = append_new_rows_first(t1_updated, new_rows_for_mail_1, header_map_first)
+     # ✅ 기존행 빈칸 보강
+    t1_updated = fill_znot_into_first_table(t1_updated, zmap)
+
+    # --- 두 번째 표 (Outlook 기반 재조립) ---
+    t2 = cur_tables[1]
+    
+    # (1) 기존 표 파싱
+    rows = table_rows(t2)
+    if len(rows) < 2:
+        log("[MAIL/SECOND] 기존 표 행이 부족합니다.")
+        parsed_existing = []
+        hdrs = ["No.", "등록일", "QN #", "QN TYPE", "품번", "이슈 내용"]
+    else:
+        hdrs = [strip_html(c) for c in re.findall(r"(?is)<t[dh][^>]*>.*?</t[dh]>", rows[0])]
+        # ✅ 공백 헤더(&nbsp; 등) 제거
+        hdrs = [h for h in hdrs if h.strip() not in ("", "&nbsp;")]
+        hdr_cnt = len(hdrs)
+        parsed_existing = []
+        # ✅ start=2 → 제거 (Outlook이 자동 생성한 빈 <tr> 2개 무시)
+        for row_html in rows[1:]:
+            cells = [strip_html(c) for c in re.findall(r"(?is)<t[dh][^>]*>.*?</t[dh]>", row_html)]
+            if not any(c.strip() for c in cells) or all(c.replace("&nbsp;", "").strip() == "" for c in cells):
+                continue
+            if len(cells) < hdr_cnt:
+                cells += [""] * (hdr_cnt - len(cells))
+            elif len(cells) > hdr_cnt:
+                cells = cells[:hdr_cnt]
+            parsed_existing.append(dict(zip(hdrs, cells)))
+        log(f"[MAIL/SECOND] 기존 표 파싱 완료: {len(parsed_existing)}건 (열={hdr_cnt})")
+    
+    # (2) 삭제 반영
+    if deleted_second:
+        before = len(parsed_existing)
+        parsed_existing = [
+            r for r in parsed_existing
+            if (r.get("QN #", "").strip() or r.get("QN", "").strip()) not in deleted_second
+        ]
+        log(f"[MAIL/SECOND] 삭제 반영 완료: {before} → {len(parsed_existing)}건")
+    
+
+    # (3) 신규 추가
+    for r in new_rows_second:
+        qn = str(r.get("QN", "")).strip()
+        if not qn:
+            continue
+    
+        # 기존 행 중 이미 같은 QN이 있으면 skip
+        exists = any(
+            (row.get("QN #", "").strip() or row.get("QN", "").strip()) == qn
+            for row in parsed_existing
+        )
+        if exists:
+            continue
+    
+        d = detail_map.get(qn, {})
+    
+        # ✅ 표준 키 기반 dict 생성
+        new_row = {
+            "No": "",
+            "Created": r.get("Created", ""),
+            "QN": qn,
+            "QN_Type": d.get("QN_Type", ""),
+            "Material": d.get("Material", ""),
+            "Issue": d.get("Issue", ""),
+        }
+    
+        parsed_existing.append(new_row)
+
+    log(f"[MAIL/SECOND] 신규 행 추가 완료 후 총 {len(parsed_existing)}건")
+    
+    # (4) 번호 재정렬
+    for i, row in enumerate(parsed_existing, start=1):
+        row["No."] = str(i)
+
+    hdrs = [re.sub(r"[\u200b\u200c\u200d\ufeff\xa0]", "", h).strip() for h in hdrs]
+    # 헤더 → 표준필드 키 매핑 (인덱스 기반)
+    # 표준필드 키: "No", "Created", "QN", "QN_Type", "Material", "Issue"
+    selector = {}
+    for i, h in enumerate(hdrs):
+        H = _norm_header(h)
+    
+        # ✅ QN TYPE 먼저 검사 (QN보다 앞에!)
+        if any(k in H for k in ["qntype", "type"]):
+            selector[i] = "QN_Type"
+        elif any(k in H for k in ["no", "번호"]):
+            selector[i] = "No"
+        elif any(k in H for k in ["등록일", "created", "creationdate"]):
+            selector[i] = "Created"
+        elif any(k in H for k in ["qn#", "notification", "note", "notenumber", "qn"]):
+            selector[i] = "QN"
+        elif any(k in H for k in ["품번", "material", "partno", "partnumber"]):
+            selector[i] = "Material"
+        elif any(k in H for k in ["이슈내용", "이슈", "issue", "description", "shorttext", "text"]):
+            selector[i] = "Issue"
+
+    # (5) 새 HTML 조립
+    base_style = "font-family:'Malgun Gothic'; font-size:10pt; text-align:center;"
+    rows_html = []
+
+    # 5-1) 헤더 행
+    header_html = "<tr>" + "".join(
+        f"<th style='{base_style} font-weight:normal;'>{h}</th>" for h in hdrs
+    ) + "</tr>"
+    rows_html.append(header_html)
+
+    # 5-2) 데이터 행
+    for row in parsed_existing:
+        tds = []
+        for col_idx, h in enumerate(hdrs):
+            # 1️⃣ 기존행(헤더키) 우선
+            val = row.get(h, None)
+            # 2️⃣ 없으면 매핑된 표준키로 재조회
+            if val in (None, ""):
+                std_key = selector.get(col_idx)
+                if std_key:
+                    val = row.get(std_key, "")
+            tds.append(f"<td style='{base_style}'>{sanitize_cell_value(val)}</td>")
+        rows_html.append("<tr>" + "".join(tds) + "</tr>")
+
+    # 최종 완성
+    t2_final = (
+        "<table style='border-collapse:collapse; table-layout:fixed; width:auto; font-family:\"Malgun Gothic\"; font-size:10pt;'>"
+        + "".join(rows_html)
+        + "</table>"
+    )
+    # ✅ 두 번째 표 안정화(셀수/공백 보정)
+    t2_final = sanitize_table_second(t2_final)
+
+    
+
+
+    # --- 번호 재정렬 ---
+    t1_final = renumber_first_table(t1_updated)
+    
+    # 첫 번째 표 값만 정리 (구조 유지)
+    t1_final = sanitize_table_cells_preserve_structure(t1_final)
+    
+    
+    # --- 메일 본문 갱신 ---
+    new_body = cur_html.replace(cur_tables[0], t1_final, 1).replace(cur_tables[1], t2_final, 1)
+    new_body = finalize_outlook_html(new_body)
+    new_mail.HTMLBody = new_body
+
+    # --- 색상/정렬 적용 ---
+    apply_final_table_styles_then_colors()
+
+    log("✅ 전체 파이프라인 완료 (모든 로그 참고)")
+
+
+if __name__ == "__main__":
+    try:
+        # 1️⃣ 메일 생성 / 갱신
+        main()
+        log("✅ 1단계: 메일 생성 및 표 갱신 완료")
+
+        # 2️⃣ 통계 요약 블록 추가
+        mail, total, sat_d3, sat_d5, sat_d8 = parse_first_table_C1Ck_2row_header()
+        append_summary_in_mail(mail, total, sat_d3, sat_d5, sat_d8)
+        log("✅ 2단계: 통계 요약 블록 추가 완료")
+
+    except Exception:
+        log_exc("MAIN+SUMMARY")
