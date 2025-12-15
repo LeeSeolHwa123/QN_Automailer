@@ -1,0 +1,115 @@
+import os, re, datetime as dt
+import traceback
+
+def dstr(d): return d.strftime("%Y%m%d")
+def log(msg): print(msg, flush=True)
+
+# --- 기존 파싱 함수 복사 필요 ---
+def parse_zqcn(filepath):
+    rows = []
+    QN_RE = re.compile(r"\b(\d{8})\b")
+    DATE_RE = re.compile(r"\b(\d{2}/\d{2}/\d{2})\b")
+    if not os.path.isfile(filepath):
+        log(f"[ZQCN] 파일 없음: {filepath}")
+        return []
+    with open(filepath, "r", encoding="utf-8-sig", errors="ignore") as f:
+        for ln in f:
+            s = ln.strip()
+            if not s: continue
+            m_qn = QN_RE.search(s)
+            if not m_qn: continue
+            qn = m_qn.group(1)
+            m_date = DATE_RE.search(s)
+            created = ""
+            if m_date:
+                try:
+                    created = dt.datetime.strptime(m_date.group(1), "%y/%m/%d").strftime("%Y.%m.%d")
+                except: pass
+            rows.append({"QN": qn, "Created": created})
+    log(f"[ZQCN] {os.path.basename(filepath)} → {len(rows)}건 추출")
+    return rows
+
+
+def extract_d_values_from_znot(filepath, target_qns):
+    if not os.path.isfile(filepath):
+        log(f"[ZNOT] 파일 없음: {filepath}")
+        return []
+    with open(filepath,"r",encoding="utf-8-sig",errors="ignore") as f:
+        lines=[ln.rstrip("\r\n") for ln in f]
+
+    header_idx=None; headers=[]
+    for i,ln in enumerate(lines):
+        if "Note number" in ln and "Elapsed" in ln:
+            header_idx=i
+            headers=[h.strip() for h in ln.split("\t") if h.strip()]
+            break
+    if header_idx is None:
+        log("[ZNOT] 헤더 미발견")
+        return []
+
+    colmap = {h.lower(): idx for idx,h in enumerate(headers)}
+    def get_val(cells, key):
+        k = key.lower()
+        for name, idx in colmap.items():
+            if k in name and idx < len(cells):
+                return cells[idx]
+        return ""
+
+    target_set = set(str(x) for x in target_qns)
+    results=[]
+    for ln in lines[header_idx+1:]:
+        if not ln.strip(): continue
+        raw = ln.split("\t")
+        cells=[c.strip() for c in raw if c.strip()]
+        if not cells: continue
+        qn = get_val(cells,"note number")
+        if not qn or qn not in target_set: continue
+        task = get_val(cells,"task code")
+        elapsed = get_val(cells,"elapsed")
+        tn = (task or "").upper().replace(" ","")
+        if tn in ("D-3C","D-5C","D-8"):
+            results.append({"QN":qn,"Task":task,"Elapsed":elapsed})
+    log(f"[ZNOT] 추출={len(results)}건 (예: {results[:]}) / 대상={len(target_set)}건")
+    return results
+
+
+def count_qn_records():
+    """QM03 없이 ZQCN/ZNOT 파일 기준으로 전체 건수만 확인"""
+    DAY = dt.date.today()
+    EXPORT_DIR = r"C:\Users\seolhl\OneDrive - kochind.com\Documents\SAP\SAP GUI"
+    FILE_ZQCN_FIRST  = "{YYYYMMDD}.txt"
+    FILE_ZQCN_SECOND = "{YYYYMMDD}_Q1.txt"
+    FILE_ZNOT        = "{YYYYMMDD}_ZNOT.txt"
+
+    f_first  = os.path.join(EXPORT_DIR, FILE_ZQCN_FIRST.format(YYYYMMDD=dstr(DAY)))
+    f_second = os.path.join(EXPORT_DIR, FILE_ZQCN_SECOND.format(YYYYMMDD=dstr(DAY)))
+    f_znot   = os.path.join(EXPORT_DIR, FILE_ZNOT.format(YYYYMMDD=dstr(DAY)))
+
+    rows_first = parse_zqcn(f_first)
+    rows_second = parse_zqcn(f_second)
+    qns_first = [r["QN"] for r in rows_first]
+    znot_data = extract_d_values_from_znot(f_znot, qns_first)
+
+    total_first = len(rows_first)
+    total_second = len(rows_second)
+    total_znot = len(znot_data)
+    total_all = total_first + total_second
+
+    log("------------------------------------------------")
+    log(f"📊 전체 QN 건수 요약 ({DAY})")
+    log(f" - C1~CK : {total_first}건")
+    log(f" - Q1~Q9 : {total_second}건")
+    log(f" - ZNOT  : {total_znot}건 (D-3C/5C/8)")
+    log("------------------------------------------------")
+    log(f"총 QN 수 (C1~CK + Q1~Q9) = {total_all}건")
+
+    return {
+        "C1_CK": total_first,
+        "Q1_Q9": total_second,
+        "ZNOT": total_znot,
+        "TOTAL": total_all
+    }
+
+
+if __name__ == "__main__":
+    count_qn_records()
