@@ -1,0 +1,49 @@
+{
+  "execution_date": "20250112",
+  "date_range_start": "20250101",
+  "date_range_end": "20250112",
+  "export_dir": "C:/Users/seolhl/OneDrive - kochind.com/Documents/SAP/SAP GUI",
+  "mail_recipients": "seolhwa.lee@molex.com",
+  "plant": "2201",
+  "mail_subject_key": "QN 등록 현황 공유",
+  "use_active_mail_first": true,
+  "file_templates": {
+    "first": "{YYYYMMDD}.txt",
+    "second": "{YYYYMMDD}_Q1.txt",
+    "znot": "{YYYYMMDD}_ZNOT.txt"
+  },
+  "types_first": [
+    "C1",
+    "C3",
+    "C5",
+    "C7",
+    "G1",
+    "G3",
+    "G5",
+    "G7",
+    "N1",
+    "CK"
+  ],
+  "types_second": [
+    "Q1",
+    "Q2",
+    "Q3",
+    "Q4",
+    "Q5",
+    "Q6",
+    "Q7",
+    "Q8",
+    "Q9"
+  ],
+  "auto_generate_files": true,
+  "max_email_scan": 200,
+  "cleanup_outbox_drafts": true,
+  "apply_styles": true,
+  "font_name": "맑은 고딕",
+  "font_size": 10,
+  "color_thresholds": {
+    "d3": 1,
+    "d5": 5,
+    "d8": 20
+  }
+}
