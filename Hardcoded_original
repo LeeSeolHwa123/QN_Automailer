@@ -21,6 +21,7 @@ CONFIG = {
     "FILE_SECOND": "{YYYYMMDD}_Q1.txt",
     "FILE_ZNOT": "{YYYYMMDD}_ZNOT.txt",
 }
+
 # =========================
 # QN TYPE 집합 정의
 # =========================
