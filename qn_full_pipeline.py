@@ -1376,6 +1376,7 @@ def apply_final_table_styles_then_colors(
     data_start_row=3,
     apply_header_style=True,
     clear_header_emphasis=True,
+    use_initial_color_rules=False,
 ):
     """
     1️⃣ (선택) 모든 표에 '표 눈금 밝게' 스타일 적용
@@ -1388,7 +1389,10 @@ def apply_final_table_styles_then_colors(
         if clear_header_emphasis:
             clear_table_header_emphasis()
 
-    apply_table_color_rules(data_start_row)
+    if use_initial_color_rules:
+        apply_table_color_rules_initial()
+    else:
+        apply_table_color_rules(data_start_row)
     apply_final_format_to_tables()
     try:
         apply_uniform_body_font()
@@ -1681,16 +1685,7 @@ def build_first_mail_from_files(day):
     except Exception:
         log("[INIT][WARN] Outlook Inspector 활성화 실패")
 
-    # 8) 스타일 적용 (기존 함수 사용)
-    try:
-        apply_table_nungum_style_to_all_tables()
-        apply_table_color_rules_initial()
-        apply_final_format_to_tables()
-        log("✅ [INIT] 초기 전용 스타일(눈금→색상→정렬) 적용 완료")
-    except Exception as e:
-        log(f"[INIT] 스타일 적용 중 오류: {e}")
-
-    # 9) 본문 요약 및 KPI 블록 작성
+    # 8) 본문 요약 및 KPI 블록 작성
     try:
         mail_obj, total, sat_d3, sat_d5, sat_d8 = parse_first_table_C1Ck_2row_header(mail)
         append_summary_in_mail(mail_obj, total, sat_d3, sat_d5, sat_d8)
@@ -1698,11 +1693,17 @@ def build_first_mail_from_files(day):
     except Exception as e:
         log(f"[INIT][WARN] 본문 요약 추가 중 오류: {e}")
 
-    try:
-        apply_uniform_body_font(mail)
-        log("✅ [INIT] 본문 폰트/크기 통일 완료")
-    except Exception as e:
-        log(f"[INIT][WARN] 본문 폰트 통일 실패: {e}")
+    styled = apply_single_pass_styles(
+        mail,
+        initial_mode=True,
+        data_start_row=3,
+        apply_header_style=True,
+        clear_header_emphasis=True,
+    )
+    if styled:
+        log("✅ [INIT] 최종 서식(스타일·색상·폰트) 한 번만 적용 완료")
+    else:
+        log("[INIT][WARN] 최종 서식 적용 중 오류가 발생했습니다 (상세 로그 참조)")
 
     return mail
 
@@ -1836,6 +1837,45 @@ def _ensure_word_editor(mail_item=None):
                     pass
 
     raise RuntimeError("Outlook Word 편집기를 초기화하지 못했습니다.")
+
+
+def activate_mail_inspector(mail_item):
+    """Ensure the target mail inspector stays active before Word edits."""
+    if not mail_item:
+        return
+    try:
+        inspector = mail_item.GetInspector()
+        inspector.Display()
+        try:
+            inspector.Activate()
+        except Exception:
+            pass
+    except Exception:
+        log_exc("ACTIVATE_MAIL")
+
+
+def apply_single_pass_styles(
+    mail_item=None,
+    *,
+    initial_mode=False,
+    data_start_row=3,
+    apply_header_style=True,
+    clear_header_emphasis=True,
+):
+    """Run the heavy styling batch once after all content mutations."""
+    if mail_item is not None:
+        activate_mail_inspector(mail_item)
+    try:
+        apply_final_table_styles_then_colors(
+            data_start_row=data_start_row,
+            apply_header_style=apply_header_style,
+            clear_header_emphasis=clear_header_emphasis,
+            use_initial_color_rules=initial_mode,
+        )
+        return True
+    except Exception:
+        log_exc("FINAL_STYLE_PASS")
+        return False
 
 
 ###############################################################################
@@ -2016,10 +2056,6 @@ def append_summary_in_mail(mail, total, sat_d3, sat_d5, sat_d8):
     # ────────────────────────────────
     wrapper_style = "font-family:'Malgun Gothic'; font-size:10pt;"
     mail.HTMLBody = f"<div style=\"{wrapper_style}\">{new_body}</div>"
-    try:
-        apply_uniform_body_font(mail)
-    except Exception:
-        log_exc("UNIFORM_FONT_SUMMARY")
 
 
 def _normalize_header_for_anchor(text):
@@ -2161,11 +2197,14 @@ def _main_impl(progress_cb=None, message_cb=None):
             material = d.get("Material", "") or "-"
             issue = (d.get("Issue", "") or "-").replace("\n", " ").strip()
             parts.append(
-                f"{qn} | 등록일 {created} | TYPE {qn_type} | 품번 {material} | 이슈 {issue}"
+                f"QN {qn} | 등록일 {created} | TYPE {qn_type} | 품번 {material} | 이슈 {issue}"
             )
 
-        joined = "; ".join(parts)
-        return f"기존 보고서에 없던 새로운 {kind_label} QN을 확인했습니다. 신규 QN# [{joined}]"
+        bullet_lines = "\n".join(f"    - {text}" for text in parts)
+        return (
+            f"기존 보고서에 없던 새로운 {kind_label} QN을 확인했습니다.\n"
+            f"{bullet_lines}"
+        )
 
     def _fmt_deleted(kind_label, deleted_list):
         if not deleted_list:
@@ -2189,18 +2228,6 @@ def _main_impl(progress_cb=None, message_cb=None):
         emit(7, msg)
 
     print("[DEBUG] main() 진입")
-
-    def _activate_mail(mail_item):
-        """해당 메일 인스펙터를 활성화해 Word 편집/스타일 대상이 올바르도록 보장."""
-        try:
-            insp = mail_item.GetInspector()
-            insp.Display()
-            try:
-                insp.Activate()
-            except Exception:
-                pass
-        except Exception:
-            log_exc("ACTIVATE_MAIL")
 
     # QN_Automailer가 주입하지 않았을 때만 settings 파일을 적용
     global _SETTINGS_APPLIED
@@ -2524,7 +2551,7 @@ def _main_impl(progress_cb=None, message_cb=None):
     recipients = MAIL_RECIPIENTS if MAIL_RECIPIENTS else list(DEFAULT_MAIL_RECIPIENTS)
     new_mail.To = "; ".join(recipients)
     new_mail.Display()
-    _activate_mail(new_mail)
+    activate_mail_inspector(new_mail)
     log("[MAIL] 새 메일 창 표시(원본 스타일 복제 + 날짜 치환)")
 
     # =========================
@@ -2709,28 +2736,27 @@ def _main_impl(progress_cb=None, message_cb=None):
     new_body = finalize_outlook_html(new_body)
     new_mail.HTMLBody = new_body
 
-    # --- 색상/정렬 적용 ---
-    _activate_mail(new_mail)
-    apply_final_table_styles_then_colors(
-        data_start_row=3,
-        apply_header_style=True,
-        clear_header_emphasis=True,
-    )
-
     # ✅ 요약 블록 삽입 (총 건수 및 D-3/5/8 비율)
     total = sat_d3 = sat_d5 = sat_d8 = 0
     try:
-        _activate_mail(new_mail)
+        activate_mail_inspector(new_mail)
         mail_obj, total, sat_d3, sat_d5, sat_d8 = parse_first_table_C1Ck_2row_header(new_mail)
         append_summary_in_mail(mail_obj, total, sat_d3, sat_d5, sat_d8)
         log("[MAIL] 요약 블록 추가 완료")
     except Exception:
         log_exc("SUMMARY_APPEND")
 
-    try:
-        apply_uniform_body_font(new_mail)
-    except Exception:
-        log_exc("UNIFORM_FONT")
+    styled_update = apply_single_pass_styles(
+        new_mail,
+        initial_mode=False,
+        data_start_row=3,
+        apply_header_style=True,
+        clear_header_emphasis=True,
+    )
+    if styled_update:
+        log("✅ [MAIL] 최종 서식을 한 번만 적용했습니다.")
+    else:
+        log("[MAIL][WARN] 최종 서식 적용 중 오류가 발생했습니다 (상세 로그 참조).")
 
     _emit_kpi(total, sat_d3, sat_d5, sat_d8)
     emit(8, "최신 정보로 보고서 메일 본문을 생성했습니다.")
@@ -2755,6 +2781,12 @@ if __name__ == "__main__":
             mail, total, sat_d3, sat_d5, sat_d8 = parse_first_table_C1Ck_2row_header()
             append_summary_in_mail(mail, total, sat_d3, sat_d5, sat_d8)
             log("✅ 2단계: 통계 요약 블록 추가 완료")
+
+            # 3️⃣ 최종 서식 일괄 적용
+            if apply_single_pass_styles(mail, initial_mode=False):
+                log("✅ 3단계: 최종 서식 일괄 적용 완료")
+            else:
+                log("[WARN] 3단계: 최종 서식 적용 중 오류 (상세 로그 참조)")
 
     except Exception:
         log_exc("MAIN+SUMMARY")

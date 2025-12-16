@@ -1,9 +1,9 @@
 {
-  "execution_date": "20250112",
+  "execution_date": "20251028",
   "date_range_start": "20250101",
-  "date_range_end": "20250112",
+  "date_range_end": "20251028",
   "export_dir": "C:/Users/seolhl/OneDrive - kochind.com/Documents/SAP/SAP GUI",
-  "mail_recipients": "seolhwa.lee@molex.com",
+  "mail_recipients": "Byungjin.Hong@molex.com;  JoonYong.Son@molex.com;  YongHyuk.Ahn@molex.com;  myeongjun.kim@molex.com",
   "plant": "2201",
   "mail_subject_key": "QN 등록 현황 공유",
   "use_active_mail_first": true,
