@@ -647,22 +647,86 @@ def get_active_mail():
 
 def find_latest_qn_mail_before_date(target_date: dt.date):
     """테스트 날짜 '이전' 메일만 후보"""
-    outlook, mapi = _get_outlook_namespace()
-    sent = mapi.GetDefaultFolder(5)  # Sent
-    items = sent.Items
-    items.Sort("[SentOn]", True)
-    try: items.IncludeRecurrences=True
-    except: pass
-    for i in range(1, min(200, items.Count)+1):
-        it = items.Item(i)
-        if getattr(it,"Class",None) != 43: continue
-        subj = (getattr(it,"Subject","") or "")
-        sent_on = getattr(it, "SentOn", None)
-        sent_date = sent_on.date() if sent_on else None
-        if MAIL_SUBJECT_KEY in subj and sent_date and (sent_date < target_date):
-            log(f"[MAIL] 후보: {subj} | SentOn={sent_on}")
-            return it
-    return None
+    try:
+        outlook, mapi = _get_outlook_namespace()
+        log("[MAIL] Outlook 네임스페이스 획득 성공")
+        
+        sent = mapi.GetDefaultFolder(5)  # Sent
+        log("[MAIL] 보낸 편지함 접근 성공")
+        
+        items = sent.Items
+        item_count = items.Count
+        log(f"[MAIL] 보낸 편지함 총 메일 수: {item_count}건")
+        
+        if item_count == 0:
+            log("[MAIL] 보낸 편지함이 비어 있습니다.")
+            return None
+        
+        items.Sort("[SentOn]", True)
+        log("[MAIL] 메일 정렬 완료 (발송일 기준 내림차순)")
+        
+        try: 
+            items.IncludeRecurrences = True
+        except: 
+            pass
+        
+        search_limit = min(200, item_count)
+        log(f"[MAIL] 최근 {search_limit}건 검색 시작 (키워드: '{MAIL_SUBJECT_KEY}')")
+        
+        for i in range(1, search_limit + 1):
+            try:
+                it = items.Item(i)
+                if getattr(it, "Class", None) != 43: 
+                    continue
+                    
+                subj = (getattr(it, "Subject", "") or "")
+                sent_on = getattr(it, "SentOn", None)
+                sent_date = sent_on.date() if sent_on else None
+                
+                if MAIL_SUBJECT_KEY in subj and sent_date and (sent_date < target_date):
+                    log(f"[MAIL] ✅ 후보 발견: {subj} | SentOn={sent_on}")
+                    return it
+            except Exception as e:
+                log(f"[MAIL][WARN] {i}번째 메일 처리 중 오류: {e}")
+                continue
+        
+        log(f"[MAIL] '{MAIL_SUBJECT_KEY}' 키워드를 포함한 메일을 찾지 못했습니다.")
+        return None
+        
+    except Exception as e:
+        log(f"[MAIL][ERROR] 보낸편지함 검색 중 오류 발생: {e}")
+        log_exc("find_latest_qn_mail_before_date")
+        return None
+
+
+def _build_prev_file_from_latest_mail(target_date: dt.date, prefix: str) -> str | None:
+    """Create a temporary baseline text file containing QNs extracted from
+    the most recent sent report mail before `target_date`.
+    Returns the temp file path or None if not available.
+    """
+    try:
+        mail = find_latest_qn_mail_before_date(target_date)
+        if not mail:
+            log("[MAIL->FILE] 기준 메일 없음")
+            return None
+
+        body = getattr(mail, "HTMLBody", None) or getattr(mail, "Body", "") or ""
+        qns = QN_RE.findall(body)
+        if not qns:
+            log("[MAIL->FILE] 기준 메일에서 QN을 추출하지 못함")
+            return None
+
+        fname = f"{prefix}_prev_mail_{target_date.strftime('%Y%m%d')}_{uuid.uuid4().hex[:8]}.txt"
+        tmp_path = os.path.join(tempfile.gettempdir(), fname)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for q in qns:
+                f.write(q + "\n")
+
+        log(f"[MAIL->FILE] Prev baseline 생성: {tmp_path} (QNs={len(qns)})")
+        return tmp_path
+    except Exception:
+        log_exc("_build_prev_file_from_latest_mail")
+        return None
 
 
 def replace_date_in_subject(subject, src_date, dst_date):
@@ -768,11 +832,13 @@ def remove_deleted_from_table(table_html, deleted_qns):
     data_start = 2 if header_secondary else 1
     kept = rows[:data_start]
     removed = []
+    deleted_norm = set(normalize_qn(x) for x in deleted_qns)
     for r in rows[data_start:]:
         cells = data_cells(r)
-        qn = cells[qn_idx] if qn_idx < len(cells) else ""
-        if qn.strip() in deleted_qns:
-            removed.append(qn.strip())
+        qn_raw = cells[qn_idx] if qn_idx < len(cells) else ""
+        qn_norm = normalize_qn(qn_raw)
+        if qn_norm in deleted_norm:
+            removed.append(qn_norm)
             continue
 
         # ✅ 열 개수 보존 (pairs 길이에 맞게 패딩)
@@ -2444,14 +2510,38 @@ def _main_impl(progress_cb=None, message_cb=None):
     if f_first_prev and os.path.isfile(f_first_prev):
         deleted_first = detect_deleted(f_first_prev, f_first_day)
     else:
-        log("[WARN] 첫 번째 표 비교 대상 파일 없음 → 삭제 QN 계산 생략")
+        # fallback: try to build a baseline from the most recent sent report mail
+        log("[WARN] 첫 번째 표 비교 대상 파일 없음 → 메일 기반 기준파일 생성 시도")
+        prev_from_mail = _build_prev_file_from_latest_mail(day, "first")
+        if prev_from_mail and os.path.isfile(prev_from_mail):
+            try:
+                deleted_first = detect_deleted(prev_from_mail, f_first_day)
+            finally:
+                try:
+                    os.remove(prev_from_mail)
+                except: # keep silent on cleanup failure
+                    pass
+        else:
+            log("[WARN] 메일 기반 기준파일 생성 실패 → 삭제 QN 계산 생략")
 
     emit(3, _fmt_deleted("C-Type", deleted_first))
 
     if f_second_prev and os.path.isfile(f_second_prev):
         deleted_second = detect_deleted(f_second_prev, f_second_day)
     else:
-        log("[WARN] 두 번째 표 비교 대상 파일 없음 → 삭제 QN 계산 생략")
+        # fallback: try to build a baseline from the most recent sent report mail
+        log("[WARN] 두 번째 표 비교 대상 파일 없음 → 메일 기반 기준파일 생성 시도")
+        prev_from_mail = _build_prev_file_from_latest_mail(day, "second")
+        if prev_from_mail and os.path.isfile(prev_from_mail):
+            try:
+                deleted_second = detect_deleted(prev_from_mail, f_second_day)
+            finally:
+                try:
+                    os.remove(prev_from_mail)
+                except:
+                    pass
+        else:
+            log("[WARN] 메일 기반 기준파일 생성 실패 → 삭제 QN 계산 생략")
 
     emit(5, _fmt_deleted("Q-Type", deleted_second))
 
@@ -2626,9 +2716,10 @@ def _main_impl(progress_cb=None, message_cb=None):
     # (2) 삭제 반영
     if deleted_second:
         before = len(parsed_existing)
+        deleted_second_norm = set(normalize_qn(x) for x in deleted_second)
         parsed_existing = [
             r for r in parsed_existing
-            if (r.get("QN #", "").strip() or r.get("QN", "").strip()) not in deleted_second
+            if normalize_qn(r.get("QN #", "") or r.get("QN", "")) not in deleted_second_norm
         ]
         log(f"[MAIL/SECOND] 삭제 반영 완료: {before} → {len(parsed_existing)}건")
     

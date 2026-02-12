@@ -525,21 +525,52 @@ def get_active_mail():
 
 def find_latest_qn_mail_before_date(target_date: dt.date):
     """테스트 날짜 '이전' 메일만 후보"""
-    outlook = win32.Dispatch("Outlook.Application")
-    mapi = outlook.GetNamespace("MAPI")
-    sent = mapi.GetDefaultFolder(5)
-    items = sent.Items
-    items.Sort("[SentOn]", True)
-    for i in range(1, min(200, items.Count)+1):
-        it = items.Item(i)
-        if getattr(it,"Class",None) != 43: continue
-        subj = (getattr(it,"Subject","") or "")
-        sent_on = getattr(it, "SentOn", None)
-        sent_date = sent_on.date() if sent_on else None
-        if MAIL_SUBJECT_KEY in subj and sent_date and (sent_date < target_date):
-            log(f"[MAIL] 후보: {subj}")
-            return it
-    return None
+    try:
+        outlook = win32.Dispatch("Outlook.Application")
+        mapi = outlook.GetNamespace("MAPI")
+        log("[MAIL] Outlook 네임스페이스 획득 성공")
+        
+        sent = mapi.GetDefaultFolder(5)
+        log("[MAIL] 보낸 편지함 접근 성공")
+        
+        items = sent.Items
+        item_count = items.Count
+        log(f"[MAIL] 보낸 편지함 총 메일 수: {item_count}건")
+        
+        if item_count == 0:
+            log("[MAIL] 보낸 편지함이 비어 있습니다.")
+            return None
+        
+        items.Sort("[SentOn]", True)
+        log("[MAIL] 메일 정렬 완료 (발송일 기준 내림차순)")
+        
+        search_limit = min(200, item_count)
+        log(f"[MAIL] 최근 {search_limit}건 검색 시작 (키워드: '{get_mail_subject_key()}')")
+        
+        for i in range(1, search_limit + 1):
+            try:
+                it = items.Item(i)
+                if getattr(it, "Class", None) != 43:
+                    continue
+                    
+                subj = (getattr(it, "Subject", "") or "")
+                sent_on = getattr(it, "SentOn", None)
+                sent_date = sent_on.date() if sent_on else None
+                
+                if get_mail_subject_key() in subj and sent_date and (sent_date < target_date):
+                    log(f"[MAIL] ✅ 후보 발견: {subj}")
+                    return it
+            except Exception as e:
+                log(f"[MAIL][WARN] {i}번째 메일 처리 중 오류: {e}")
+                continue
+        
+        log(f"[MAIL] '{get_mail_subject_key()}' 키워드를 포함한 메일을 찾지 못했습니다.")
+        return None
+        
+    except Exception as e:
+        log(f"[MAIL][ERROR] 보낸편지함 검색 중 오류 발생: {e}")
+        log_exc("find_latest_qn_mail_before_date")
+        return None
 
 # =========================
 # 메인 파이프라인
